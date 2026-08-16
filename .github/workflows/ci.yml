@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        # test files only import iof.py / generator.py (numpy, scipy); no torch needed
+        run: pip install numpy scipy scikit-learn
+      - name: Geometry unit tests
+        run: python tests/test_iof.py
+      - name: Error-model unit tests (G3 confound)
+        run: python tests/test_generator.py
+
+  feasibility-gate:
+    name: Feasibility gate (3 seeds)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install CPU-only torch
+        # keep the runner fast: the experiment trains small MLPs on CPU
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Install remaining dependencies
+        run: pip install -r requirements.txt
+      - name: Run feasibility experiment and gates
+        run: python scripts/run_feasibility.py --fail-on-gates

@@ -30,6 +30,11 @@ Gates (>=2 of 3 seeds):
 
 Run:  python scripts/run_feasibility.py [--error-model decoupled]
                                    [--out reports/feasibility_results.json]
+                                   [--fail-on-gates]
+
+`--fail-on-gates` exits non-zero unless gates G1, G2, G3 and G5 all pass,
+so CI (`.github/workflows/ci.yml`) fails on a regression of the feasibility
+verdict.
 """
 
 from __future__ import annotations
@@ -91,6 +96,8 @@ def main():
                          "IOF 1/Z target, G3 confound fixed) or 'coupled' (legacy confounded "
                          "error scale ~ motion/depth, kept for comparison)")
     ap.add_argument("--out", default=str(ROOT / "reports" / "feasibility_results.json"))
+    ap.add_argument("--fail-on-gates", action="store_true",
+                    help="exit non-zero unless gates G1, G2, G3, G5 all pass (CI mode)")
     args = ap.parse_args()
 
     if not unit_tests():
@@ -169,6 +176,10 @@ def main():
     with open(args.out, "w") as f:
         json.dump(out, f, indent=2)
     print(f"\nresults -> {args.out} ({time.time() - t0:.0f}s total)")
+
+    if args.fail_on_gates and overall != "PASS":
+        print(f"GATES NOT ALL PASS ({overall}) -> exiting 1 (CI gate)")
+        sys.exit(1)
 
 
 def run_seed_full(seed, gen):

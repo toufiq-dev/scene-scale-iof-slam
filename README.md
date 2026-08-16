@@ -51,6 +51,15 @@ python scripts/run_feasibility.py --error-model coupled \
 # results -> reports/feasibility_results.json
 ```
 
+## CI
+
+`.github/workflows/ci.yml` runs on every push and pull request:
+
+- **unit-tests** — geometry (6) and error-model (4) unit tests;
+- **feasibility-gate** — the full 3-seed experiment with `--fail-on-gates`, so the workflow
+  fails if any of gates G1, G2, G3, G5 regress from **PASS** (torch is installed CPU-only to
+  keep the runner fast).
+
 ## Key numbers (feasibility, 3 seeds, unseen test sequences, decoupled generator)
 
 | model | RMSE | AUROC |
