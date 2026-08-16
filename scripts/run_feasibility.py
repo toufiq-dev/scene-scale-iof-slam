@@ -21,7 +21,7 @@ experimental design:
      note the archived pre-fix run (reports/feasibility_results_coupled.json)
      used the original generator constants (depth 1.5--25 m, rotation weight 0.5).
 
-Gates (>=2 of 3 seeds):
+Gates (>=2 of 3 seeds; with fewer seeds all must pass):
   G1 learned > linear on same features (RMSE and AUROC)
   G2 reliability signal adds value (full > motion+depth)
   G3 geometry/depth adds value (motion+depth > motion-only on RMSE and pooled AUROC)
@@ -29,12 +29,16 @@ Gates (>=2 of 3 seeds):
   G5 current-error estimation works (h=0 << constant)
 
 Run:  python scripts/run_feasibility.py [--error-model decoupled]
+                                   [--seeds 0,1,2]
                                    [--out reports/feasibility_results.json]
                                    [--fail-on-gates]
 
 `--fail-on-gates` exits non-zero unless gates G1, G2, G3 and G5 all pass,
 so CI (`.github/workflows/ci.yml`) fails on a regression of the feasibility
-verdict.
+verdict. `--seeds` selects the RNG seeds (default 0,1,2); CI uses a single
+seed (e.g. `--seeds 0`) for the fast 1-seed smoke on pull requests and the
+full 3-seed run on main. With fewer than 3 seeds the gate rule is strict
+(all seeds must pass); with 3 seeds it is the majority rule (>=2 of 3).
 """
 
 from __future__ import annotations
@@ -98,7 +102,13 @@ def main():
     ap.add_argument("--out", default=str(ROOT / "reports" / "feasibility_results.json"))
     ap.add_argument("--fail-on-gates", action="store_true",
                     help="exit non-zero unless gates G1, G2, G3, G5 all pass (CI mode)")
+    ap.add_argument("--seeds", default="0,1,2",
+                    help="comma-separated RNG seeds (default 0,1,2; use e.g. 0 for a "
+                         "1-seed CI smoke)")
     args = ap.parse_args()
+    seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
+    if not seeds:
+        ap.error("--seeds must be a non-empty comma-separated list of integers")
 
     if not unit_tests():
         print("geometry unit tests failed; aborting")
@@ -110,7 +120,7 @@ def main():
     print(f"generator: DEPTH_CHOICES={DEPTH_CHOICES}, ROT_INNOV_WEIGHT={ROT_INNOV_WEIGHT}")
     t0 = time.time()
     per_seed, scale_all = [], []
-    for seed in SEEDS:
+    for seed in seeds:
         res, scale_rows = run_seed_full(seed, gen)
         per_seed.append(res)
         scale_all.append(scale_rows)
@@ -129,7 +139,7 @@ def main():
     print("\n================ SCENE-SCALE SPLIT (test, by median depth) ================")
     print("group    med_depth    ridge_RMSE   mlp_RMSE   naive_RMSE")
     for g in range(3):
-        row = {k_: float(np.nanmean([scale_all[s][g][k_] for s in range(len(SEEDS))]))
+        row = {k_: float(np.nanmean([scale_all[s][g][k_] for s in range(len(seeds))]))
                for k_ in ("med_depth", "ridge", "mlp", "naive")}
         print(f"{scale_all[0][g]['group']:<9} {row['med_depth']:9.2f}    "
               f"{row['ridge']:8.3f}   {row['mlp']:8.3f}   {row['naive']:8.3f}")
@@ -140,8 +150,10 @@ def main():
     def auroc_of(res, name):
         return next(r["auroc"] for r in res if r["name"] == name)
 
+    need = min(2, len(seeds))  # majority rule for 3 seeds; strict below that
+
     def gate(cond):
-        return "PASS" if sum(cond(r) for r in per_seed) >= 2 else "FAIL"
+        return "PASS" if sum(cond(r) for r in per_seed) >= need else "FAIL"
 
     g1 = gate(lambda r: rmse_of(r, "mlp full") < rmse_of(r, "ridge (same features)")
               and auroc_of(r, "mlp full") > auroc_of(r, "ridge (same features)"))
@@ -154,7 +166,7 @@ def main():
     g5 = gate(lambda r: rmse_of(r, "mlp full h=0 (current)")
               < 0.5 * rmse_of(r, "constant"))
 
-    print("\n================ GATES (over 3 seeds) ================")
+    print(f"\n================ GATES (over {len(seeds)} seed(s)) ================")
     for label, g in [("G1 learned > linear on same features", g1),
                      ("G2 reliability signal adds value", g2),
                      ("G3 geometry (depth) adds value", g3),
@@ -165,7 +177,7 @@ def main():
     overall = "PASS" if all(g == "PASS" for g in (g1, g2, g3, g5)) else "PARTIAL/FAIL"
     print(f"\nOVERALL VERDICT (G1 & G2 & G3 & G5): {overall}")
 
-    out = dict(cfg=CFG, error_model=args.error_model,
+    out = dict(cfg=CFG, seeds=seeds, error_model=args.error_model,
                generator=dict(depth_choices=list(DEPTH_CHOICES),
                               rot_innov_weight=ROT_INNOV_WEIGHT),
                gates=dict(g1=g1, g2=g2, g3=g3, g4=g4, g5=g5, overall=overall),
