@@ -113,6 +113,7 @@ def generate_sequence(
     jump_prob: float = 0.0,
     jump_scale: float = 3.0,
     depth_corruption: str = "gaussian",
+    num_samples: int = 200,
 ) -> dict:
     """Generate one synthetic sequence with runtime features and IOF targets.
 
@@ -136,6 +137,8 @@ def generate_sequence(
         jump_scale: jump magnitude relative to the per-frame innovation scale.
         depth_corruption: "gaussian" (default) or "realistic" (adds holes,
             flying pixels and specular near-spikes to the estimated depth).
+        num_samples: per-frame IOF pixel samples (the FlowAUC target and the
+            label-noise sensitivity sweep, round-3 review fix M8).
 
     Returns a dict with arrays of shape (T, ...):
         motion       (T, 6)  |translation|, |rotation| of the ESTIMATED
@@ -143,6 +146,12 @@ def generate_sequence(
         depth_stats  (T, 4)  median, q25, q75, std of the *estimated* depth
         confidence   (T, 1)  (possibly degraded) reliability signal (runtime)
         iof          (T,)    true induced optical flow (offline target)
+        flow_samples (T, S)  per-pixel induced-flow magnitudes at each frame
+                             (NaN for invalid samples) -- the FlowAUC target
+        depth_samples (T, Sd) true scene-depth samples per frame -- the input
+                             to the official metric's depth-distribution fit
+        T_gt, T_hat  (T, 4, 4) accumulated GT and estimated world-to-camera
+                             poses (the official-protocol alignment input)
         trans_err_mag (T,)   true translation-error magnitude (train-time only)
         rot_err_mag   (T,)   true rotation-error magnitude (train-time only)
         median       (T,)    true median depth (train-time only)
@@ -179,6 +188,10 @@ def generate_sequence(
         "depth_stats": [],
         "confidence": [],
         "iof": [],
+        "flow_samples": [],
+        "depth_samples": [],
+        "T_gt": [],
+        "T_hat": [],
         "trans_err_mag": [],
         "rot_err_mag": [],
         "median": [],
@@ -233,8 +246,15 @@ def generate_sequence(
             D_est[spec] = 0.3
         D_est = np.maximum(D_est, 0.5)
 
-        # --- target: IOF from TRUE error + TRUE depth (offline GT) ---
-        iof = compute_iof(se3_to_T(trans_err, rot_err), D, num_samples=200, seed=12345 + t)
+        # --- target: IOF from TRUE error + TRUE depth (offline GT); the
+        #     per-pixel flow samples are the FlowAUC target (round-3 M5) ---
+        iof, flows = compute_iof(
+            se3_to_T(trans_err, rot_err), D,
+            num_samples=num_samples, seed=12345 + t, return_flows=True,
+        )
+        # true scene-depth subsample for the official metric's depth-
+        # distribution fit (round-3 C1 machinery)
+        depth_samp = D.ravel()[rng.choice(D.size, 512, replace=False)]
 
         # --- runtime reliability signal: noisy observation of the error state ---
         noisy_err = err_mag * (1.0 + CONFIDENCE_NOISE * rng.randn())
@@ -262,6 +282,13 @@ def generate_sequence(
              float(np.percentile(d, 75)), float(np.std(d))]
         )
         rec["iof"].append(iof)
+        rec["flow_samples"].append(flows)
+        rec["depth_samples"].append(depth_samp)
+        # poses stored as WORLD-TO-CAMERA (the proposal's explicit convention,
+        # matching iof.camera_centers / relative_error_pose): the accumulated
+        # chains above are camera-to-world, so invert per frame.
+        rec["T_gt"].append(np.linalg.inv(T_gt_cum))
+        rec["T_hat"].append(np.linalg.inv(T_hat_cum))
         rec["trans_err_mag"].append(float(np.linalg.norm(trans_err)))
         rec["rot_err_mag"].append(float(np.linalg.norm(rot_err)))
         rec["median"].append(float(np.median(D)))

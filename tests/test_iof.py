@@ -8,7 +8,10 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from scene_scale.iof import (  # noqa: E402
+    align_trajectory,
     compute_iof,
+    compute_iof_official,
+    fit_depth_distribution,
     relative_error_pose,
     se3_to_T,
 )
@@ -90,6 +93,73 @@ def test_relative_error_pose_inverse_swap():
     f_r1 = compute_iof(relative_error_pose(T_est_r, T_gt_r), D, seed=11)
     f_r2 = compute_iof(relative_error_pose(T_gt_r, T_est_r), D, seed=11)
     assert abs(f_r1 - f_r2) < 0.01 * max(f_r1, f_r2)
+
+
+# --- round-3 review fixes (C1/C2/M10): official-protocol machinery -------
+
+def _traj_trans_x(step: float = 0.02, n: int = 40):
+    """GT world-to-camera trajectory: constant forward translation, no rotation."""
+    return np.stack([se3_to_T(np.array([i * step, 0.0, 0.0]), np.zeros(3))
+                     for i in range(n)])
+
+
+def test_sim3_alignment_removes_global_scale():
+    # A pure global-scale offset (camera positions at 0.5x GT) is exactly the
+    # accumulated-drift component the official metric's Umeyama Sim(3)
+    # alignment removes (review C1(a)/C2). Raw per-frame IOF grows with the
+    # scale drift; after alignment the residual error is ~0.
+    T_gt = _traj_trans_x(step=0.02, n=40)
+    # estimated: world positions scaled by 0.5 -> camera-center scale 0.5
+    T_est = np.stack([se3_to_T(np.array([i * 0.01, 0.0, 0.0]), np.zeros(3))
+                      for i in range(40)])
+    D = np.full((256, 256), 1.5)
+    raw = np.array([compute_iof(relative_error_pose(T_est[i], T_gt[i]), D, seed=7)
+                    for i in range(40)])
+    assert raw.mean() > 10.0  # the 10-cm-at-30-cm-style accumulated misalignment
+    aligned, summ = align_trajectory(T_est, T_gt)
+    assert abs(summ["scale"] - 2.0) < 0.05  # 0.5x positions -> scale factor ~2
+    off, _ = compute_iof_official(T_est, T_gt, np.full((40, 512), 1.5),
+                                  align=True, seed=7)
+    assert off.mean() < 1.0  # alignment removed the accumulated drift
+
+
+def test_official_iof_without_alignment_matches_raw_for_constant_depth():
+    # With a constant depth map the marginal depth distribution is a point
+    # mass, so the official integration (align=False) must reproduce the raw
+    # per-frame IOF up to pixel-sampling noise -- a consistency check of the
+    # depth-distribution integration against the direct computation.
+    T_gt = _traj_trans_x(step=0.02, n=40)
+    T_est = np.stack([se3_to_T(np.array([i * 0.02 + 0.01, 0.001, -0.002]),
+                               np.array([0.001, -0.002, 0.003])) for i in range(40)])
+    D = np.full((256, 256), 1.5)
+    raw = np.array([compute_iof(relative_error_pose(T_est[i], T_gt[i]), D, seed=7)
+                    for i in range(40)])
+    off, _ = compute_iof_official(T_est, T_gt, np.full((40, 512), 1.5),
+                                  align=False, seed=7)
+    ratio = off.mean() / max(raw.mean(), 1e-9)
+    assert 0.7 < ratio < 1.3
+
+
+def test_fit_depth_distribution_recovers_two_components():
+    # BIC-selected Gaussian-mixture fit must recover the number of components
+    # on a clean two-mode scene-depth distribution.
+    rng = np.random.RandomState(0)
+    x = np.concatenate([rng.normal(1.0, 0.1, 2000), rng.normal(8.0, 1.0, 2000)])
+    w, mu, sd = fit_depth_distribution(x, max_components=3, seed=0)
+    assert len(w) == 2
+    assert abs(sorted(mu)[0] - 1.0) < 0.3 and abs(sorted(mu)[1] - 8.0) < 1.5
+
+
+def test_compute_iof_return_flows_consistent_with_mean():
+    T = se3_to_T(np.array([0.01, 0.0, 0.0]), np.array([0.01, 0.0, 0.0]))
+    D = np.full((256, 256), 2.0)
+    mean, flows = compute_iof(T, D, num_samples=100, seed=11, return_flows=True)
+    assert flows.shape == (100,)
+    assert abs(mean - np.nanmean(flows)) < 1e-9  # same sampling, same mean
+    # an all-behind-camera error yields zero flow, not NaN
+    T_far = se3_to_T(np.array([0.0, 0.0, -100.0]), np.zeros(3))
+    mean2, flows2 = compute_iof(T_far, D, num_samples=100, seed=11, return_flows=True)
+    assert mean2 == 0.0 and np.isnan(flows2).all()
 
 
 if __name__ == "__main__":

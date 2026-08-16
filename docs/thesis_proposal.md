@@ -31,10 +31,12 @@ baselines, and an explicit oracle-vs-runtime-available split.
 A corrected synthetic feasibility study (this repository) validates the experimental protocol: when the
 predictor receives the same runtime-available error-state information a real SLAM exposes (estimated
 motion + noisy reliability signal), the learned model beats both the oracle-persistence baseline (pooled
-AUROC 0.992 vs 0.886) and a linear model on identical features (RMSE 0.948 vs 3.626), with the
-reliability signal and scene geometry each adding measurable value — including when the reliability
-signal is masked (the G3 gate). All five feasibility gates pass under the new, more realistic generator
-(estimated motion, depth-decoupled error model), and a stress matrix confirms the scene-scale claim
+AUROC 0.992 vs 0.909) and a linear model on identical features (RMSE 0.986 vs 3.950), with scene
+geometry adding measurable value through the 1/Z scaling — including when the reliability signal is
+masked (the G3 gate). All feasibility gates pass under the new, more realistic generator (estimated
+motion, depth-decoupled error model), a distributional head learns the FlowAUC target, the
+official-protocol IOF machinery (trajectory alignment + depth-distribution integration) is implemented
+with the raw-vs-official divergence reported, and a stress matrix confirms the scene-scale claim
 survives degraded reliability, jump failures, and realistic depth corruption. The thesis proceeds to a
 staged real-data validation on Princeton365 with DROID-SLAM as the primary backbone, culminating in an
 adaptive-SLAM demonstration in which predicted degradation triggers relocalization or stronger
@@ -121,18 +123,38 @@ Let T̂_t be the estimated pose, T^gt_t the ground-truth pose (unavailable at in
 depth, and K the intrinsics. The visual consequence is IOF_t = g(T̂_t, T^gt_t, D_t, K). At runtime, T^gt_t
 is unknown, so we ask whether
 
-**Pose convention (explicit).** T̂_t and T^gt_t are world-to-camera maps, T̂_t = T̂^{wc}_t and T^gt_t =
-T^{wc,gt}_t, matching the target-generation code (`iof.py`) and the Princeton365 definition. A scene
-point P_c in the ground-truth camera frame is mapped into the estimated camera frame by
+**Pose convention (explicit) and the two target variants (the C2 decision).** T̂_t and T^gt_t are
+world-to-camera maps, T̂_t = T̂^{wc}_t and T^gt_t = T^{wc,gt}_t, matching the target-generation code
+(`iof.py`). A scene point P_c in the ground-truth camera frame is mapped into the estimated camera
+frame by
 
     T_rel = (T̂_t)^{-1} T^gt_t,
 
-and IOF is the expected reprojection displacement induced by T_rel. Equivalently, T_rel is the SE(3)
-correction that carries the GT trajectory onto the estimated trajectory, expressed in the estimated
-frame — the pose error *as seen by the camera*, which is what determines the visual consequence. The
-convention is pinned by a unit test (`relative_error_pose_inverse_swap`: swapping est/gt inverts T_rel;
-flow magnitudes are equal for pure rotation and near-equal for small errors) and will be validated
-against the official Princeton365 IOF implementation in pilot gate P1-G1 (ρ > 0.98, §8.8).
+and the **raw per-frame IOF** is the expected reprojection displacement induced by T_rel. Equivalently,
+T_rel is the SE(3) correction that carries the GT trajectory onto the estimated trajectory, expressed
+in the estimated frame — the pose error *as seen by the camera*, which is what determines the visual
+consequence. The convention is pinned by unit tests (`relative_error_pose_inverse_swap`;
+`test_sim3_alignment_removes_global_scale`) and by the official-protocol machinery in `iof.py`.
+
+**This raw per-frame quantity is the PRIMARY target — but it is NOT the official Princeton365 metric.**
+The official metric additionally (i) aligns the estimated trajectory to GT with an Umeyama Sim(3)
+alignment followed by a Kabsch SO(3) alignment, (ii) fits a per-sequence parametric depth distribution
+(Gaussian/Gamma mixture, BIC-selected), and (iii) integrates the per-pixel flow over that depth
+distribution at every posed frame. Two consequences follow, and the thesis commits to both explicitly:
+
+1. **The official target depends on the whole trajectory and on GT poses** — it is not a function of
+   (T̂_t, T^gt_t, D_t) alone, so it cannot be the per-frame regression target; and it is
+   runtime-unreproducible by construction (evaluation-only).
+2. **Trajectory alignment removes global scale and accumulated drift** — precisely the absolute
+   misalignment the motivating example (10 cm at 30 cm) is about. Post-alignment IOF measures residual
+   relative error (jitter, local distortion), not the absolute misalignment an AR/robotics user
+   experiences.
+
+Therefore: **raw per-frame IOF is the PRIMARY (runtime-faithful) target** of the predictor, and the
+**official IOF (after Sim(3)+SO(3) alignment and marginal-depth integration) is a secondary,
+benchmark-comparable diagnostic** computed for leaderboard comparability. The synthetic feasibility
+study demonstrates the divergence between the two (§10.6) and pilot gate P1-G1 is restated as a
+reimplementation deliverable (§8.8).
 
 > E_visual = IOF_{t+h} (or its per-pixel distribution, or a failure probability) can be predicted from
 > X_t = (I_{t−k:t}, T̂_{t−k:t}, D̂_t, R_t, K),
@@ -256,6 +278,14 @@ leaderboard while supporting the model's geometry-conditioned design:
 Future targets: y_t = IOF_{t+h} (h ∈ {5, 10, 20, 30}), optionally per-pixel flow quantiles (q50, q90,
 q95) to avoid scalar-mean masking of local misalignment, Flow AUC_{t+h}, and a binary failure label
 F_{t+h} = 1[IOF_{t+h} > τ], τ from the training distribution.
+
+**Flow AUC needs a distributional head (M5).** Flow AUC is a summary of the per-pixel flow
+*distribution* (the fraction of pixels with induced flow below a threshold, averaged over the 0–100 px
+threshold grid), so it cannot be produced by a scalar-mean head. The architecture therefore has a
+**histogram head** (`models.DistributionalMLP`): a softmax over flow-magnitude bins (0–100 px), trained
+with a cross-entropy/KL loss against the per-pixel flow samples at the target frame; Flow AUC follows
+from the predicted cumulative histogram. A Beta-parameterized head is the documented alternative. The
+synthetic feasibility study validates this head against persistence and constant baselines (§10.5).
 
 ### 7.3 Architecture
 
@@ -389,7 +419,8 @@ binary decision:
 
 | Gate | Requirement | Decision if FAIL |
 |---|---|---|
-| P1-G1 | **Official IOF reproduction:** our IOF/Flow AUC implementation vs the official Princeton365 code on one sequence: per-frame correlation ρ > 0.98 | Fix implementation; do not proceed until reproduced |
+| P1-G1a | **Official-protocol reimplementation** (the deliverable, not a correlation check): our `iof.py` must reproduce the official recipe — trajectory alignment (Umeyama Sim(3) + Kabsch SO(3)), BIC-selected depth-distribution fit, marginal-depth integration, posed-frame coverage, and the camera-rig transform (below) — then match the official per-frame IOF/Flow AUC on one sequence with correlation ρ > 0.98 | Fix the implementation; do not proceed until reproduced |
+| P1-G1b | **Raw-per-frame target leg** (the PRIMARY model target, which by construction cannot match official numbers after alignment): report its correlation and scale ratio against the official target on the same sequence — the C2 diagnostic that quantifies how much accumulated drift the alignment removes | Report the divergence explicitly; the raw leg remains the runtime-faithful target |
 | P1-G2 | **Cached SLAM outputs + reliability signals** for 10–20 sequences (DROID instrumented, or ORB-SLAM3 fallback per §7.4) | Switch backbone / fix instrumentation |
 | P1-G3 | **Failure-event counts within GT-posed segments**, per category (see below): enough positives for early-warning AUROC | Redesign evaluation (scanning-first; pseudo-GT auxiliary) |
 | P1-G4 | **Depth improves motion-only** under sequence-level metrics with reliability masked (H2, the G3 analogue) | Pause; re-examine the scene-scale claim |
@@ -400,7 +431,19 @@ binary decision:
 **Pre-registered stop criterion (explicit):** if, on the 10–20 sequence pilot, the full model does not
 beat the runtime-available persistence proxy (B6) by at least **0.05 within-sequence AUROC**, the
 project pauses and re-evaluates — the forecasting claim would not be supported, and the thesis would
-re-scope to a negative/descriptive result rather than quietly proceeding.
+re-scope to a negative/descriptive result rather than quietly proceeding. (P1-G5 gates the H1
+within-sequence claim; the H2 scene-scale claim is gated separately by P1-G4 on sequence-level
+metrics, so a weak within-sequence margin does not by itself sink the depth hypothesis.)
+
+**Camera-rig transform and ZED correspondence (M6).** Princeton365 computes official IOF from the
+user-view (360° GT-view) poses with ZED-stereo depth attached through a calibrated rig (Bundle Rig PnP;
+paper §4.5). The dataset ships the rig transform as `relative_pose_gt_zed.npy` (T_gt←zed, mapping ZED
+left-camera points into the 360 GT view frame) and a per-sequence `video_to_zed.csv` correspondence
+(ZED frames drop non-uniformly; the CSV maps ZED frames to monocular-video indices). The real-data
+pipeline must (1) apply the rig transform before computing IOF in the user-view frame, and (2) align
+ZED depth frames to the monocular timeline via the correspondence CSV — both are part of P1-G1a.
+Additionally, prediction horizons h are reported in both frames and seconds because effective FPS
+differs across sequences.
 
 **Failure-event counts (required before Phase 3):** report, per scene category (scanning/indoor/
 outdoor), the number of high-IOF failure events that fall *within GT-posed segments* (recall: only 56.1%
@@ -427,6 +470,14 @@ analysis). This quantification is a Phase-1 deliverable, not an afterthought.
   Report all four, plus the number of sequences with valid positive/negative labels and AUROC
   stratified by near/medium/far scene scale. **The primary early-warning metric is within-sequence,
   not pooled.**
+
+  **What the per-sequence threshold measures (M7).** τ_s = Q₇₅(IOF_s) mechanically marks ~25% of each
+  sequence as failure, so the within-sequence AUROC leg measures *ranking within the top quartile*
+  (can the model order the worst quarter of frames?) — it is a ranking criterion, not event
+  detection. Event detection is the separate **warning lead-time** metric below (fixed risk threshold
+  chosen on validation, minimum failure duration, detection rate, false alarms, precision at fixed
+  lead time). The thesis reports both and states which claim each supports: a model can rank well
+  without detecting events, and vice versa.
 * **ECE** for the calibrated failure probability (plus Brier score and a reliability diagram in the
   final study); **warning lead time** in frames with a *fixed* risk threshold chosen on validation,
   a minimum failure duration (short blips are noise), detection rate, false alarms and precision at
@@ -442,10 +493,13 @@ analysis). This quantification is a Phase-1 deliverable, not an afterthought.
   category. Unposed frames can still provide auxiliary self-supervised targets (photometric/flow
   consistency) — a scoped extension.
 * **Pipeline:** run a pretrained SLAM system once on a Princeton365 subset, cache poses/depth/statistics
-  (the predictor must *not* re-run SLAM during training). Staged: 10–20 sequences, governed by the
-  pre-registered Phase-1 gates P1-G1…P1-G7 including official-IOF reproduction (ρ > 0.98) and the
-  failure-event-count analysis (§8.8) → 50–80 (learns anything?) → full training split → official
-  test sequences.
+  (the predictor must *not* re-run SLAM during training). Targets are computed offline from the cached
+  outputs: apply the camera-rig transform (`relative_pose_gt_zed.npy`) to bring ZED depth into the GT
+  user-view frame, align ZED frames to the monocular timeline via `video_to_zed.csv`, then compute both
+  the raw per-frame IOF (primary) and the official trajectory-aligned IOF (diagnostic; §3, §8.8).
+  Staged: 10–20 sequences, governed by the pre-registered Phase-1 gates P1-G1…P1-G7 including
+  official-protocol reproduction (ρ > 0.98) and the failure-event-count analysis (§8.8) → 50–80
+  (learns anything?) → full training split → official test sequences.
 * **Compute:** consumer GPU / Colab T4 target; frozen pretrained components + small trainable predictor;
   ~$100 budget envelope (see companion cost plan).
 
@@ -464,56 +518,62 @@ confound (see the feasibility report, §3). Round-2 review fixes applied in this
 motion by default** (relative motion derived from an accumulated estimated trajectory corrupted by the
 pose error — what a running SLAM actually exposes), the oracle-vs-runtime-available baseline split
 (B1–B9, §8.1), **within-sequence AUROC as the primary early-warning metric**, the full input-combination
-ablation matrix, and a **generator stress matrix** (§10.4). Results (test on unseen sequences, 3 seeds,
-estimated-motion generator):
+ablation matrix, and a **generator stress matrix** (§10.4). Round-3 review fixes: the **official-protocol
+IOF machinery** (trajectory alignment + BIC depth-distribution integration, §10.6), a **distributional
+Flow AUC head** (§10.5), the **label-noise sensitivity sweep** (§10.7), and the explicit raw-vs-official
+target decision (§3). **RGB caveat (M4): the synthetic study has no visual channel — RGB's value is a
+real-data-only question, tested by the Phase-1 ablation (input set + RGB).** Results (test on unseen
+sequences, 3 seeds, estimated-motion generator):
 
 ### 10.1 Main results
 
 | model | RMSE | medSpearman | AUROC (pooled) | **wAUROC (within-seq)** | AP |
 |---|---|---|---|---|---|
-| constant | 4.209 | — | 0.500 | 0.500 | 0.263 |
-| persistence (oracle, B1) | 3.446 | 0.116 | 0.886 | 0.549 | 0.718 |
-| ridge (same features, B5) | 3.626 | 0.125 | 0.880 | 0.519 | 0.648 |
-| classical cov-prop (blind, B7) | 2.826 | 0.032 | 0.918 | 0.509 | 0.761 |
-| gru (temporal, B9) | 1.323 | 0.566 | 0.981 | 0.638 | 0.957 |
-| mlp motion-only | 1.729 | 0.666 | 0.971 | 0.721 | 0.939 |
-| mlp motion+depth | 1.124 | 0.683 | 0.988 | 0.672 | 0.970 |
-| **mlp full** | **0.948** | **0.792** | **0.992** | **0.688** | **0.981** |
-| analytic 2-stage (phys-explicit, B8) | 1.914 | 0.676 | 0.966 | 0.637 | 0.903 |
-| mlp full h=0 (current, B6) | 0.798 | 0.826 | 0.995 | 0.688 | 0.988 |
+| constant | 4.529 | — | 0.500 | 0.500 | 0.245 |
+| persistence (oracle, B1) | 3.355 | 0.113 | 0.909 | 0.552 | 0.770 |
+| ridge (same features, B5) | 3.950 | 0.109 | 0.873 | 0.516 | 0.669 |
+| classical cov-prop (blind, B7) | 2.953 | 0.005 | 0.937 | 0.510 | 0.770 |
+| gru (temporal, B9) | 2.088 | 0.349 | 0.971 | 0.582 | 0.925 |
+| mlp motion-only | 1.845 | 0.657 | 0.974 | 0.703 | 0.941 |
+| mlp motion+depth | 1.073 | 0.694 | 0.988 | 0.655 | 0.967 |
+| **mlp full** | **0.986** | **0.762** | **0.992** | **0.669** | **0.976** |
+| analytic 2-stage (phys-explicit, B8) | 1.865 | 0.642 | 0.976 | 0.625 | 0.925 |
+| mlp full h=0 (current, B6) | 0.815 | 0.822 | 0.994 | 0.683 | 0.984 |
 
 wAUROC = pooled AUROC under the *per-sequence* failure threshold τ_s = Q₇₅(IOF_s) — the primary
-early-warning metric (cannot be gamed by detecting scene scale). Three honest observations:
+early-warning metric (cannot be gamed by detecting scene scale). Four honest observations:
 
 * **The classical baseline is non-trivial but blind.** Blind covariance propagation (AR forecast
   covariance through the analytic IOF Jacobian, using only estimated motion and estimated depth)
-  *beats* ridge and persistence on RMSE (2.826) and pooled AUROC (0.918) — it is scene-scale-aware —
-  yet is chance within-sequence (wAUROC 0.509): it never observes the error realization, so it cannot
+  *beats* ridge and persistence on RMSE (2.953) and pooled AUROC (0.937) — it is scene-scale-aware —
+  yet is chance within-sequence (wAUROC 0.510): it never observes the error realization, so it cannot
   anticipate within-sequence degradation. This is exactly why the learned model matters and why
   within-sequence is the primary metric.
-* **The GRU (B9) does not beat the MLP.** The fair temporal baseline (RMSE 1.323 vs 0.948) confirms
-  the contribution is the *task formulation* (features carry the signal), not the architecture.
-* **Depth is a between-sequence signal.** Within-sequence, motion-only's wAUROC (0.721) slightly
-  exceeds motion+depth's (0.672): depth statistics are nearly constant inside a sequence, so their
+* **The GRU (B9) does not beat the MLP** (2.088 vs 0.986) and is unstable across seeds (±0.89): the
+  contribution is the *task formulation* (features carry the signal), not the architecture.
+* **Depth is a between-sequence signal.** Within-sequence, motion-only's wAUROC (0.703) slightly
+  exceeds motion+depth's (0.655): depth statistics are nearly constant inside a sequence, so their
   value is cross-sequence (scene-scale), captured by RMSE and pooled AUROC — not by within-sequence
   AUROC. Both views are reported; G3 gates on the between-sequence legs.
+* **The reliability signal's marginal value is thin on this draw** (full 0.986 vs motion+depth 1.073,
+  −8%; seeds 1–2 pass, seed 0 fails by 5%) — see §10.4 and the real-data caveat (P1-G6).
 
 ### 10.2 Input-combination ablation (the reviewer-required matrix)
 
 | Inputs | RMSE | AUROC (pooled) | wAUROC (within-seq) |
 |---|---|---|---|
-| motion only | 1.729 | 0.971 | 0.721 |
-| depth only | 2.701 | 0.924 | 0.510 |
-| reliability only | 4.075 | 0.633 | 0.565 |
-| motion + depth | 1.124 | 0.988 | 0.672 |
-| motion + reliability | 1.468 | 0.982 | 0.717 |
-| depth + reliability | 2.568 | 0.934 | 0.531 |
-| **full (motion+depth+reliability)** | **0.948** | **0.992** | **0.688** |
+| motion only | 1.845 | 0.974 | 0.703 |
+| depth only | 2.767 | 0.946 | 0.511 |
+| reliability only | 4.225 | 0.656 | 0.573 |
+| motion + depth | 1.073 | 0.988 | 0.655 |
+| motion + reliability | 1.535 | 0.980 | 0.720 |
+| depth + reliability | 2.541 | 0.949 | 0.544 |
+| **full (motion+depth+reliability)** | **0.986** | **0.992** | **0.669** |
 
 *Motion+depth vs motion-only* (both WITHOUT reliability) is the **reliability-masked depth test** — the
-G3 gate: RMSE −35%, pooled AUROC 0.988 vs 0.971, both legs in every seed. *Full vs motion+reliability*
-(G6, reported) asks whether depth still adds value when reliability is present: RMSE −35% again
-(0.948 vs 1.468). The depth channel carries the scene-scale claim with and without the reliability
+G3 gate: RMSE −42%, pooled AUROC 0.988 vs 0.974, both legs in every seed. *Full vs motion+reliability*
+(G6, reported) asks whether depth still adds value when reliability is present: RMSE −36%
+(0.986 vs 1.535). The depth channel carries the scene-scale claim with and without the reliability
 signal.
 
 ### 10.3 Failure-definition comparison (mlp full; pooled AUROC, mean over seeds)
@@ -521,9 +581,9 @@ signal.
 | Definition | AUROC |
 |---|---|
 | Global threshold (τ = Q₇₅ train) | 0.992 |
-| **Per-sequence threshold τ_s (PRIMARY)** | **0.688** |
-| Robust z-score (z > 1.5, per-sequence) | 0.810 |
-| Depth-normalized (IOF·Ẑ_med) | 0.251 |
+| **Per-sequence threshold τ_s (PRIMARY)** | **0.669** |
+| Robust z-score (z > 1.5, per-sequence) | 0.757 |
+| Depth-normalized (IOF·Ẑ_med) | 0.273 |
 
 The global number is inflated by between-sequence depth differences (near scenes are simply "worse").
 The per-sequence number is the honest early-warning metric. The depth-normalized number is a diagnostic
@@ -533,45 +593,97 @@ metrics are invariant to this rescaling (a per-sequence constant multiple). This
 artifact to resolve against the official Flow-AUC protocol on real data (P1-G1), not a claim about the
 predictor.
 
-Scene-scale split (test, by true median depth): near (0.81 m) MLP RMSE **1.079** vs ridge 5.214 /
-persistence 5.367; medium (4.44 m) 0.951 vs 2.782 / 2.275; far (18.15 m) 0.791 vs 2.083 / 1.188 — the
+Scene-scale split (test, by true median depth): near (0.83 m) MLP RMSE **1.124** vs ridge 5.721 /
+persistence 5.329; medium (4.49 m) 0.970 vs 2.847 / 1.929; far (18.12 m) 0.833 vs 2.223 / 1.223 — the
 model tracks near-scene degradation (where Princeton365 concentrates its object-scanning sequences) far
 better than the baselines.
 
-**Gates (≥2 of 3 seeds):** G1 learned > linear on same features — PASS (RMSE 0.948 vs 3.626; AUROC 0.992
-vs 0.880); G2 reliability signal adds value — PASS (full vs motion+depth: RMSE 0.948 vs 1.124);
-G3 depth adds value with reliability **MASKED** — **PASS** (motion+depth vs motion-only: RMSE 1.124 vs
-1.729, −35%, pooled AUROC 0.988 vs 0.971, both legs in every seed; the pre-fix PARTIAL was a two-part
-generator artifact — depth coupled into the error scale, plus a rotation-flow floor compressing depth's
-label effect over a 1.5–25 m range — resolved by the decoupled error model and the scene-scale-faithful
-range); G4 beats oracle persistence — PASS (0.948 vs 3.446; the original failure is resolved); G5
-current-error estimation works — PASS (h=0 RMSE 0.798 vs constant 4.209); G6 depth with reliability
-present (reported) — PASS. Overall: **PASS** (was PARTIAL/FAIL).
+**Gates (≥2 of 3 seeds):** G1 learned > linear on same features — PASS (RMSE 0.986 vs 3.950; AUROC 0.992
+vs 0.873); G2 reliability signal adds value — PASS (2/3 seeds; full vs motion+depth: RMSE 0.986 vs
+1.073 — seed-0 margin is thin, see §10.4); G3 depth adds value with reliability **MASKED** — **PASS**
+(motion+depth vs motion-only: RMSE 1.073 vs 1.845, −42%, pooled AUROC 0.988 vs 0.974, both legs in
+every seed; the pre-fix PARTIAL was a two-part generator artifact — depth coupled into the error scale,
+plus a rotation-flow floor compressing depth's label effect over a 1.5–25 m range — resolved by the
+decoupled error model and the scene-scale-faithful range); G4 beats oracle persistence — PASS (0.986 vs
+3.355; the original failure is resolved); G5 current-error estimation works — PASS (h=0 RMSE 0.815 vs
+constant 4.529); G6 depth with reliability present (reported) — PASS. Overall: **PASS** (was
+PARTIAL/FAIL).
 
 ### 10.4 Generator stress matrix (1 seed each; full results in `reports/stress_results.json`)
 
 | Variant | full RMSE | wAUROC | G1 | G2 | G3 | G5 |
 |---|---|---|---|---|---|---|
-| baseline (estimated motion) | 1.029 | 0.715 | PASS | PASS | PASS | PASS |
-| true motion (pre-fix input) | 1.095 | 0.704 | PASS | PASS | PASS | PASS |
-| reliability: delayed (3 frames) | 1.053 | 0.707 | PASS | PASS | PASS | PASS |
-| reliability: noisy | 0.965 | 0.711 | PASS | PASS | PASS | PASS |
-| reliability: miscalibrated | 1.005 | 0.710 | PASS | PASS | PASS | PASS |
-| reliability: masked | 1.232 | 0.693 | PASS | **FAIL** | PASS | PASS |
-| reliability: intermittent | 1.052 | 0.704 | PASS | PASS | PASS | PASS |
-| jump failures | 1.275 | 0.701 | PASS | **FAIL** | PASS | PASS |
-| realistic depth corruption | 1.013 | 0.680 | PASS | PASS | PASS | PASS |
+| baseline (estimated motion) | 1.114 | 0.674 | PASS | **FAIL** | PASS | PASS |
+| true motion (pre-fix input) | 1.092 | 0.663 | PASS | **FAIL** | PASS | PASS |
+| reliability: delayed (3 frames) | 1.060 | 0.665 | PASS | **FAIL** | PASS | PASS |
+| reliability: noisy | 0.965 | 0.688 | PASS | PASS | PASS | PASS |
+| reliability: miscalibrated | 1.068 | 0.672 | PASS | **FAIL** | PASS | PASS |
+| reliability: masked | 1.252 | 0.646 | PASS | **FAIL** | PASS | PASS |
+| reliability: intermittent | 1.034 | 0.679 | PASS | PASS | PASS | PASS |
+| jump failures | 1.209 | 0.705 | PASS | PASS | PASS | PASS |
+| realistic depth corruption | 1.090 | 0.668 | PASS | **FAIL** | PASS | PASS |
 
-Two findings, both honest:
+Three findings, all honest:
 
-* **G3 — the scene-scale claim — survives every degradation**, including masked reliability and
-  realistic depth corruption. The depth channel does not lean on an idealized reliability signal.
-* **G2 fails exactly where the reliability signal is genuinely unusable**: masked (no information by
-  construction) and jump failures (a smooth `confidence ≈ exp(−5·‖err‖)` observation cannot anticipate
-  an abrupt within-horizon jump). A model can only extract value from a signal that carries it; the
-  real-data analogue is that reliability helps predict smooth drift, not sudden relocalization jumps —
-  which is precisely why the drift-vs-jump decomposition and lead-time evaluation (§8.7, R2) are
-  mandatory on real data.
+* **G3 — the scene-scale claim — survives every degradation**, including masked reliability, jump
+  failures and realistic depth corruption. The depth channel does not lean on an idealized reliability
+  signal.
+* **G2's margin is thin on seed 0** (full 1.114 vs motion+depth 1.059, i.e. the seed-0 full model is
+  ~5% worse), so the 1-seed stress run flips it in most variants — including the *baseline*, which is a
+  seed artifact, not a variant effect. What is still visible: the **masked** variant is worst (1.252,
+  the largest gap), and information-*preserving* variants (noisy, intermittent, jumps) keep G2
+  positive. The 3-seed majority verdict (§10.3) is the gate that counts; the stress matrix shows the
+  reliability signal's marginal value is small and seed-dependent — reinforcing that its real-data
+  value is contingent on the instrumentation deliverable (P1-G2/P1-G6).
+* Estimated vs true motion barely moves any gate — the round-1 conclusions were not an artifact of
+  clean motion input.
+
+### 10.5 FlowAUC leg: the distributional head is learnable (M5)
+
+RMSE of the predicted FlowAUC at tau ∈ {1, 5, 20} px and of the official 0–100 AUC (mean CDF,
+rescaled to 0–100), mean over 3 seeds:
+
+| model | tau=1 px | tau=5 px | tau=20 px | official AUC |
+|---|---|---|---|---|
+| histogram head (learned) | **0.157** | **0.160** | **0.073** | **0.021** |
+| persistence (oracle) | 0.270 | 0.311 | 0.115 | 0.040 |
+| constant | 0.209 | 0.420 | 0.099 | 0.051 |
+
+The learned distributional head beats both baselines at every threshold — the `FlowAUC_{t+h}` target
+is implementable as specified (percentile bins; Beta head as documented alternative).
+
+### 10.6 Official-protocol leg: raw vs official IOF (C1/C2)
+
+On 3 fresh synthetic sequences per seed (`iof.py`'s `compute_iof_official`: Sim(3)+SO(3) alignment,
+BIC-selected Gaussian-mixture depth fit, marginal-depth quadrature):
+
+| quantity | value |
+|---|---|
+| corr(raw, official, **unaligned**) | 0.871 |
+| corr(raw, official, **aligned**) | 0.641 |
+| scale ratio official/raw (aligned) | 0.944 |
+| BIC-selected GMM components | 3 |
+
+The unaligned official quantity tracks the raw target (corr 0.87, ratio ≈ 1); after trajectory
+alignment the correlation drops to 0.64 — the alignment removes the accumulated-drift component that
+dominates the raw target on some sequences, so the two estimators measure different signal. This is
+why the thesis keeps raw per-frame IOF as the PRIMARY (runtime-faithful) target, treats official IOF as
+a benchmark-comparable diagnostic, and restates P1-G1 as a reimplementation deliverable (§8.8).
+
+### 10.7 Label-noise sensitivity (M8): 100/200/500/1000 samples
+
+1 seed per count (`--sweep-samples`; `reports/samples_sweep.json`):
+
+| num_samples | mlp full RMSE | wAUROC | G1 | G3 |
+|---|---|---|---|---|
+| 100 | 1.093 | 0.668 | PASS | PASS |
+| 200 | 1.114 | 0.674 | PASS | PASS |
+| 500 | 1.106 | 0.673 | PASS | PASS |
+| 1000 | 1.083 | 0.675 | PASS | PASS |
+
+The 200-sample default is not a label-noise liability: RMSE varies ±1.4% and wAUROC ±0.004 across a
+10× change in samples. (The marginal-depth official estimator on real data will have different label
+noise — the sweep machinery carries over to P1-G1.)
 
 **What this study does and does not prove.** It proves the experimental protocol works: with
 runtime-available error-state information, the learned predictor beats the oracle-persistence and linear
@@ -579,7 +691,9 @@ baselines, is scene-scale-aware, and — with the confound fixed and the input r
 the depth channel adds measurable value through the geometric 1/Z scaling (G3) with and without the
 reliability signal. It does *not* prove the same on real SLAM error dynamics — the synthetic generator
 makes IOF strongly determined by runtime features, and real DROID-SLAM errors involve drift, jumps, and
-relocalization events with different autocorrelation structure. The gate therefore justifies proceeding
+relocalization events with different autocorrelation structure. **It also does not validate the visual
+(RGB) leg of the input (no visual channel exists in the generator — M4) and it demonstrates, rather
+than resolves, the raw-vs-official IOF divergence (C2, §10.6).** The gate therefore justifies proceeding
 to the small real-data pilot (§8.8, §9), with the persistence baseline mandatory in every table and the
 depth-scaling hypothesis (H2) re-tested against real ZED depth and error statistics under the
 pre-registered stop criterion (P1-G5).
@@ -592,16 +706,17 @@ pre-registered stop criterion (P1-G5).
 | Persistence dominates on real data (error process ~ random walk) | Medium | Explicit drift-vs-jump decomposition; lead-time evaluation; adaptive-SLAM contribution independent of forecasting win |
 | GT coverage limits lead-time evaluation | High | Restrict to posed segments; report effective coverage; auxiliary self-supervised targets |
 | Reliability signals unavailable / DROID instrumentation fragile | Medium | ORB-SLAM3 fallback backbone (native tracking signals); signal masking ablation; stress matrix shows G3 survives masked reliability |
-| ZED depth noise in targets | Medium | Denoise targets; report official-variant numbers; P1-G1 validates our IOF against the official implementation |
+| ZED depth noise in targets | Medium | Denoise targets; report official-variant numbers; P1-G1a validates our IOF against the official implementation |
 | Data scale / compute (435 GB dataset) | High | Staged subset pipeline; cached SLAM outputs; frozen pretrained components |
 
 ## 12. Timeline and Deliverables
 
 * **Phase 0 (done):** synthetic feasibility gate (this repository).
-* **Phase 1 (Months 1–2):** Princeton365 subset pipeline; IOF target generation; **official-IOF
-  reproduction gate (P1-G1, ρ > 0.98)**; DROID-SLAM instrumentation with ORB-SLAM3 fallback decision;
+* **Phase 1 (Months 1–2):** Princeton365 subset pipeline (rig transform + ZED correspondence); IOF
+  target generation; **official-protocol reimplementation gate (P1-G1a, ρ > 0.98)** plus the
+  raw-per-frame target leg (P1-G1b); DROID-SLAM instrumentation with ORB-SLAM3 fallback decision;
   failure-event counts within posed segments; cached outputs — all governed by the pre-registered
-  pilot gates P1-G1…P1-G7 (§8.8).
+  pilot gates P1-G1a/P1-G1b…P1-G7 (§8.8).
 * **Phase 2 (Months 3–5):** predictor training on 50–80 sequences; ablations; baseline table (B1–B9);
   h=0 vs h decomposition.
 * **Phase 3 (Months 6–8):** full-split training; cross-category and cross-backbone generalization;

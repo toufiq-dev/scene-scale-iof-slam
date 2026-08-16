@@ -134,6 +134,29 @@ def test_realistic_depth_corruption_degrades_depth_stats():
     assert b["depth_stats"][:, 3].mean() > a["depth_stats"][:, 3].mean()
 
 
+def test_flow_samples_recorded_and_consistent_with_iof():
+    # The per-frame per-pixel flow samples (the FlowAUC target, round-3 M5)
+    # must be recorded, mostly finite, and average to the scalar IOF target.
+    s = generate_sequence(seq_len=40, seed=9, num_samples=150)
+    assert s["flow_samples"].shape == (40, 150)
+    finite = np.isfinite(s["flow_samples"])
+    assert finite.mean() > 0.8
+    per_frame = np.nanmean(np.where(finite, s["flow_samples"], np.nan), axis=1)
+    assert np.allclose(per_frame, s["iof"], atol=1e-9)
+    # poses for the official-protocol alignment leg are recorded too
+    assert s["T_gt"].shape == (40, 4, 4) and s["T_hat"].shape == (40, 4, 4)
+    assert s["depth_samples"].shape == (40, 512)
+
+
+def test_num_samples_changes_label_noise():
+    # Fewer IOF pixel samples -> noisier targets (the M8 sensitivity the
+    # sweep quantifies): the same sequence's IOF target differs across counts.
+    a = generate_sequence(seq_len=60, seed=13, num_samples=100)
+    b = generate_sequence(seq_len=60, seed=13, num_samples=1000)
+    assert not np.allclose(a["iof"], b["iof"])
+    assert np.corrcoef(a["iof"], b["iof"])[0, 1] > 0.9
+
+
 def test_invalid_motion_source_raises():
     try:
         generate_sequence(seq_len=10, seed=0, motion_source="nope")

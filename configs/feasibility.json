@@ -1,6 +1,6 @@
 {
   "experiment": "synthetic-feasibility-fixed",
-  "description": "Corrected feasibility gate with the G3 confound fixed and round-2 review fixes applied: estimated (corrupted) motion by default, oracle vs runtime-available baselines, GRU + classical covariance-propagation baselines, per-sequence (within-sequence) failure thresholds as the primary early-warning metric, full input-combination ablation matrix, and a generator stress matrix (degraded reliability, jump failures, realistic depth corruption).",
+  "description": "Corrected feasibility gate with the G3 confound fixed and round-2/round-3 review fixes applied: estimated (corrupted) motion by default, oracle vs runtime-available baselines, GRU + classical covariance-propagation baselines, per-sequence (within-sequence) failure thresholds as the primary early-warning metric, full input-combination ablation matrix, a generator stress matrix (degraded reliability, jump failures, realistic depth corruption), the official-protocol IOF machinery (trajectory alignment + BIC depth-distribution integration) with a raw-vs-official comparison leg, a distributional FlowAUC head, and a label-noise sensitivity sweep over IOF sample counts.",
   "seeds": [0, 1, 2],
   "data": {
     "n_train": 60,
@@ -31,7 +31,20 @@
   "windows": {
     "k": 5,
     "h": 5,
-    "num_samples_iof": 200
+    "num_samples_iof": 200,
+    "samples_sweep": [100, 200, 500, 1000]
+  },
+  "flowauc_head": {
+    "kind": "distributional (percentile bins over 0-100 px)",
+    "bins": 9,
+    "thresholds_px": [1, 5, 20],
+    "official_auc_grid": [0, 100, 41]
+  },
+  "official_iof_leg": {
+    "alignment": "Umeyama Sim(3) + Kabsch SO(3)",
+    "depth_distribution": "BIC-selected Gaussian mixture (max 3 components)",
+    "integration": "log-spaced quadrature (0.1-60 m, 32 nodes)",
+    "sequences": 3
   },
   "model": {
     "kind": "mlp",

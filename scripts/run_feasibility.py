@@ -42,6 +42,24 @@ Round-2 review fixes (this version):
     (delayed/noisy/miscalibrated/masked/intermittent), jump failures, and
     realistic depth corruption.
 
+Round-3 review fixes (this version):
+
+  * **official-protocol IOF machinery** (C1/C2/M10): the proposal's P1-G1 gate
+    is a *reimplementation deliverable* -- the repo now ships the official
+    protocol's trajectory alignment (Umeyama Sim(3) + Kabsch SO(3)) and
+    BIC-selected depth-distribution integration (`iof.py`). The runner
+    reports a raw-vs-official target comparison leg on synthetic sequences:
+    correlation (the check that both measure the same quantity) AND scale
+    ratio (the C2 evidence that alignment removes the accumulated-drift
+    component the raw target is built on).
+  * **FlowAUC target with a distributional head** (M5): the generator records
+    per-pixel flow samples and the runner trains a histogram head
+    (`models.DistributionalMLP`) that predicts the flow distribution at
+    t+h; Flow AUC(tau) follows from the predicted cumulative histogram and
+    is reported against oracle persistence and constant baselines.
+  * **label-noise sensitivity sweep** (`--sweep-samples`): the reviewer-
+    requested 100/200/500/1000 per-frame IOF sample counts (M8).
+
 Gates (>=2 of 3 seeds; with fewer seeds all must pass):
   G1 learned > linear on same features (RMSE and AUROC)
   G2 reliability signal adds value (full > motion+depth)
@@ -91,13 +109,20 @@ from scene_scale.generator import (  # noqa: E402
     DEPTH_CHOICES,
     generate_sequence,
 )
-from scene_scale.iof import compute_iof, se3_to_T  # noqa: E402
+from scene_scale.iof import (  # noqa: E402
+    compute_iof,
+    compute_iof_official,
+    se3_to_T,
+)
 from scene_scale.models import (  # noqa: E402
     fit_ridge,
+    flow_auc_from_probs,
+    predict_distributional,
     predict_gru,
     predict_mlp,
     split_gru_inputs,
     standardize,
+    train_distributional,
     train_gru,
     train_mlp,
 )
@@ -156,7 +181,17 @@ def main():
     ap.add_argument("--stress", action="store_true",
                     help="also run the 1-seed generator stress matrix (degraded reliability, "
                          "jump failures, realistic depth) -> reports/stress_results.json")
+    ap.add_argument("--samples", type=int, default=200,
+                    help="per-frame IOF pixel samples (default 200; the M8 label-noise "
+                         "sweep uses 100/200/500/1000)")
+    ap.add_argument("--sweep-samples", action="store_true",
+                    help="run the label-noise sensitivity sweep over per-frame IOF sample "
+                         "counts 100/200/500/1000 (1 seed each) -> reports/samples_sweep.json "
+                         "and exit")
     args = ap.parse_args()
+    if args.sweep_samples:
+        run_sweep(args.error_model)
+        return
     seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
     if not seeds:
         ap.error("--seeds must be a non-empty comma-separated list of integers")
@@ -165,18 +200,22 @@ def main():
         print("geometry unit tests failed; aborting")
         sys.exit(1)
 
-    gen = partial(generate_sequence, error_model=args.error_model)
+    gen = partial(generate_sequence, error_model=args.error_model,
+                  num_samples=args.samples)
     print(f"\n================ FEASIBILITY (FIXED DESIGN, error_model={args.error_model}) "
           f"================\n"
           f"generator: DEPTH_CHOICES={DEPTH_CHOICES}, ROT_INNOV_WEIGHT={ROT_INNOV_WEIGHT}, "
-          f"motion_source=estimated (default), reliability_mode=clean")
+          f"motion_source=estimated (default), reliability_mode=clean, "
+          f"num_samples={args.samples}")
     t0 = time.time()
-    per_seed, scale_all, fail_defs = [], [], []
+    per_seed, scale_all, fail_defs, fa_all, official_all = [], [], [], [], []
     for seed in seeds:
-        res, scale_rows, fdef = run_seed_full(seed, gen)
+        res, scale_rows, fdef, fa, official = run_seed_full(seed, gen)
         per_seed.append(res)
         scale_all.append(scale_rows)
         fail_defs.append(fdef)
+        fa_all.append(fa)
+        official_all.append(official)
         print(f"seed {seed} done ({time.time() - t0:.0f}s)")
 
     names = [r["name"] for r in per_seed[0]]
@@ -205,6 +244,25 @@ def main():
                for k_ in ("med_depth", "ridge", "mlp", "naive")}
         print(f"{scale_all[0][g]['group']:<9} {row['med_depth']:9.2f}    "
               f"{row['ridge']:8.3f}   {row['mlp']:8.3f}   {row['naive']:8.3f}")
+
+    print("\n===== FLOWAUC LEG (distributional head vs baselines; RMSE, mean over seeds) =====")
+    print("tau=1px    tau=5px    tau=20px   officialAUC(0-100)")
+    for label, key in (("model (histogram head)", "model"),
+                       ("persistence (oracle)", "persist"),
+                       ("constant", "constant")):
+        cells = [f"{np.nanmean([f_[key][k] for f_ in fa_all]):.4f}"
+                 for k in ("fa1", "fa5", "fa20", "fa_auc")]
+        print(f"  {label:<24} {'   '.join(cells)}")
+
+    print("\n===== OFFICIAL-PROTOCOL LEG (raw vs official IOF on synthetic sequences) =====")
+    print("    corr(raw,official)   scale-ratio(official/raw)   GMM components")
+    o_al = np.nanmean([o["corr_aligned"] for o in official_all])
+    o_unal = np.nanmean([o["corr_unaligned"] for o in official_all])
+    o_ratio = np.nanmean([o["ratio_aligned"] for o in official_all])
+    o_ratio_unal = np.nanmean([o["ratio_unaligned"] for o in official_all])
+    o_k = int(round(np.nanmean([o["gmm_components"] for o in official_all])))
+    print(f"  aligned   {o_al:.3f}   ratio {o_ratio:.3f}   (unaligned corr {o_unal:.3f}, "
+          f"ratio {o_ratio_unal:.3f})  k={o_k}")
 
     def rmse_of(res, name):
         return next(r["rmse"] for r in res if r["name"] == name)
@@ -248,13 +306,25 @@ def main():
     out = dict(cfg=CFG, seeds=seeds, error_model=args.error_model,
                generator=dict(depth_choices=list(DEPTH_CHOICES),
                               rot_innov_weight=ROT_INNOV_WEIGHT,
-                              motion_source="estimated", reliability_mode="clean"),
+                              motion_source="estimated", reliability_mode="clean",
+                              num_samples=args.samples),
                gates=dict(g1=g1, g2=g2, g3=g3, g4=g4, g5=g5, g6=g6, overall=overall),
                failure_definitions=dict(
                    global_tau=[f["global_tau"] for f in fail_defs],
                    per_seq=[f["per_seq"] for f in fail_defs],
                    zscore=[f["zscore"] for f in fail_defs],
                    depthnorm=[f["depthnorm"] for f in fail_defs]),
+               flowauc=dict(model=[{k: f_["model"][k] for k in ("fa1", "fa5", "fa20",
+                                                                 "fa_auc")} for f_ in fa_all],
+                            persist=[{k: f_["persist"][k] for k in ("fa1", "fa5",
+                                                                     "fa20", "fa_auc")} for f_ in fa_all],
+                            constant=[{k: f_["constant"][k] for k in ("fa1", "fa5",
+                                                                       "fa20", "fa_auc")} for f_ in fa_all]),
+               official_iof=dict(corr_aligned=[o["corr_aligned"] for o in official_all],
+                                 corr_unaligned=[o["corr_unaligned"] for o in official_all],
+                                 ratio_aligned=[o["ratio_aligned"] for o in official_all],
+                                 ratio_unaligned=[o["ratio_unaligned"] for o in official_all],
+                                 gmm_components=[o["gmm_components"] for o in official_all]),
                per_seed=[{r["name"]: {k_: r[k_] for k_ in
                                       ("rmse", "nrmse", "med_spearman", "auroc",
                                        "med_auroc", "wauroc", "med_wauroc", "ap")}
@@ -265,21 +335,22 @@ def main():
     print(f"\nresults -> {args.out} ({time.time() - t0:.0f}s total)")
 
     if args.stress:
-        run_stress(args.error_model)
+        run_stress(args.error_model, args.samples)
 
     if args.fail_on_gates and overall != "PASS":
         print(f"GATES NOT ALL PASS ({overall}) -> exiting 1 (CI gate)")
         sys.exit(1)
 
 
-def run_stress(error_model: str):
+def run_stress(error_model: str, num_samples: int = 200):
     """1-seed gate matrix over the generator stress variants."""
     print("\n================ STRESS MATRIX (1 seed each) ================")
     t0 = time.time()
     results = {}
     for label, kwargs in STRESS_VARIANTS.items():
-        gen = partial(generate_sequence, error_model=error_model, **kwargs)
-        res, _, _ = run_seed_full(0, gen)
+        gen = partial(generate_sequence, error_model=error_model,
+                      num_samples=num_samples, **kwargs)
+        res, _, _ = run_seed_full(0, gen)[:3]
         rmse = lambda n: next(r["rmse"] for r in res if r["name"] == n)  # noqa: E731
         auroc = lambda n: next(r["auroc"] for r in res if r["name"] == n)  # noqa: E731
         wauroc = lambda n: next(r["wauroc"] for r in res if r["name"] == n)  # noqa: E731
@@ -310,8 +381,11 @@ def run_stress(error_model: str):
 
 
 def run_seed_full(seed, gen):
-    """Full per-seed experiment; returns (results list, scene-scale rows,
-    failure-definition comparison dict)."""
+    """Full per-seed experiment.
+
+    Returns (results list, scene-scale rows, failure-definition comparison
+    dict, flowauc dict, official-iof leg dict).
+    """
     seed0 = 1000 + 100 * seed
     splits = build_dataset(CFG["n_train"], CFG["n_val"], CFG["n_test"],
                            CFG["seq_len"], CFG["k"], CFG["h"], seed0,
@@ -437,7 +511,188 @@ def run_seed_full(seed, gen):
                                ridge=ev.pooled_rmse(y_te[sel], p_ridge[sel]),
                                mlp=ev.pooled_rmse(y_te[sel], mlp_preds["full"][sel]),
                                naive=ev.pooled_rmse(y_te[sel], te["yp"][sel])))
-    return results, scale_rows, fail_defs
+
+    # --- FlowAUC leg (round-3 M5): distributional histogram head vs baselines.
+    #     Target: the per-pixel flow distribution at t+h; FlowAUC(tau) is the
+    #     fraction of pixels with flow < tau, reported at 1/5/20 px plus the
+    #     official 0-100 px AUC (mean CDF, rescaled to 0-100).
+    fa = flowauc_leg(tr, va, te, masks, seed)
+
+    # --- official-protocol leg (round-3 C1/C2): raw vs official IOF on a few
+    #     fresh synthetic sequences -- correlation (same quantity?) and scale
+    #     ratio (how much of the raw target the trajectory alignment removes).
+    official = official_iof_leg(gen, seed)
+
+    return results, scale_rows, fail_defs, fa, official
+
+
+def flowauc_leg(tr, va, te, masks, seed: int):
+    """Train the distributional FlowAUC head and compare against baselines.
+
+    Returns dict(model/persist/constant) each with RMSE of the predicted
+    FlowAUC(tau) at tau in {1, 5, 20} px and of the official 0--100 AUC.
+    Persistence is the oracle variant (true per-pixel flows at time t); the
+    constant predicts the training-set mean FlowAUC vector.
+    """
+    sc = StandardScaler().fit(tr["X"][:, masks["full"]])
+    Ztr = sc.transform(tr["X"][:, masks["full"]]).astype(np.float32)
+    Zva = sc.transform(va["X"][:, masks["full"]]).astype(np.float32)
+    Zte = sc.transform(te["X"][:, masks["full"]]).astype(np.float32)
+    thr = (1.0, 5.0, 20.0)
+    true_te = flow_auc_from_probs(flow_hist(te["yflow"]), thresholds=thr)
+    true_persist = flow_auc_from_probs(flow_hist(te["yflowp"]), thresholds=thr)
+    auc_te = flow_auc_auc(te["yflow"])
+    auc_persist = flow_auc_auc(te["yflowp"])
+    # constant: training-set mean FlowAUC at each threshold
+    true_tr = flow_auc_from_probs(flow_hist(tr["yflow"]), thresholds=thr)
+    c_vec = np.concatenate([true_tr.mean(0), [flow_auc_auc(tr["yflow"]).mean()]])
+
+    def rmse_vec(pred):
+        err = pred - np.concatenate([true_te, auc_te[:, None]], axis=1)
+        return np.sqrt(np.mean(err ** 2, axis=0))
+
+    mg = train_distributional(Ztr, tr["yflow"], Zva, va["yflow"], seed=42 + seed)
+    probs = predict_distributional(mg, Zte)
+    pred_model = np.concatenate(
+        [flow_auc_from_probs(probs, thresholds=thr), flow_auc_auc_from_probs(probs)[:, None]],
+        axis=1,
+    )
+    pred_persist = np.concatenate([true_persist, auc_persist[:, None]], axis=1)
+    pred_const = np.broadcast_to(c_vec[None, :], pred_model.shape)
+    r_model, r_persist, r_const = (rmse_vec(p) for p in (pred_model, pred_persist, pred_const))
+    return dict(
+        model=dict(fa1=float(r_model[0]), fa5=float(r_model[1]),
+                   fa20=float(r_model[2]), fa_auc=float(r_model[3])),
+        persist=dict(fa1=float(r_persist[0]), fa5=float(r_persist[1]),
+                     fa20=float(r_persist[2]), fa_auc=float(r_persist[3])),
+        constant=dict(fa1=float(r_const[0]), fa5=float(r_const[1]),
+                      fa20=float(r_const[2]), fa_auc=float(r_const[3])),
+    )
+
+
+def flow_hist(flows):
+    """(N, S) per-pixel flow samples -> (N, K) normalized bin counts."""
+    from scene_scale.models import flow_histograms
+
+    return flow_histograms(flows)
+
+
+def flow_auc_auc(flows, grid=(0.0, 100.0, 41)):
+    """Official-style Flow AUC: mean CDF over the 0--100 px threshold grid.
+
+    Returns (N,) values on the 0--1 scale (multiply by 100 for the official
+    score). The CDF at each grid threshold comes from the empirical
+    per-pixel flow distribution.
+    """
+    from scene_scale.models import FLOW_BIN_EDGES
+
+    probs = flow_hist(flows)
+    taus = np.linspace(grid[0], grid[1], grid[2])
+    cdf = np.cumsum(probs, axis=1)
+    upper = FLOW_BIN_EDGES[1:]
+    out = np.zeros((len(probs), len(taus)))
+    for j, tau in enumerate(taus):
+        idx = int(np.searchsorted(upper, tau))
+        if idx >= len(upper):
+            out[:, j] = 1.0
+            continue
+        below = cdf[:, idx - 1] if idx > 0 else 0.0
+        lo = upper[idx - 1] if idx > 0 else 0.0
+        frac = (tau - lo) / max(upper[idx] - lo, 1e-9)
+        out[:, j] = below + probs[:, idx] * frac
+    return out.mean(axis=1)
+
+
+def flow_auc_auc_from_probs(probs):
+    """Official-style Flow AUC from predicted bin probabilities (mean CDF)."""
+    from scene_scale.models import FLOW_BIN_EDGES
+
+    cdf = np.cumsum(probs, axis=1)
+    upper = FLOW_BIN_EDGES[1:]
+    taus = np.linspace(0.0, 100.0, 41)
+    out = np.zeros((len(probs), len(taus)))
+    for j, tau in enumerate(taus):
+        idx = int(np.searchsorted(upper, tau))
+        if idx >= len(upper):
+            out[:, j] = 1.0
+            continue
+        below = cdf[:, idx - 1] if idx > 0 else 0.0
+        lo = upper[idx - 1] if idx > 0 else 0.0
+        frac = (tau - lo) / max(upper[idx] - lo, 1e-9)
+        out[:, j] = below + probs[:, idx] * frac
+    return out.mean(axis=1)
+
+
+def official_iof_leg(gen, seed: int, n_seq: int = 3, seq_len: int = 80):
+    """Raw vs official-protocol IOF on fresh synthetic sequences.
+
+    Computes per-frame raw IOF (the primary target) and official IOF (with
+    and without trajectory alignment) for ``n_seq`` generated sequences and
+    returns per-sequence correlations and scale ratios -- the C1/C2 evidence:
+    correlation asks whether both measure the same quantity, the scale ratio
+    quantifies how much of the raw target the alignment removes.
+    """
+    from scipy.stats import pearsonr
+
+    cors_al, cors_unal, ratio_al, ratio_unal, ks = [], [], [], [], []
+    for j in range(n_seq):
+        seq = gen(seq_len=seq_len, seed=2000 + seed * 100 + j)
+        raw = seq["iof"]
+        off_al, (w, mu, sd) = compute_iof_official(
+            seq["T_hat"], seq["T_gt"], seq["depth_samples"], align=True, seed=seed
+        )
+        off_unal, _ = compute_iof_official(
+            seq["T_hat"], seq["T_gt"], seq["depth_samples"], align=False, seed=seed
+        )
+        cors_al.append(float(pearsonr(raw, off_al).statistic))
+        cors_unal.append(float(pearsonr(raw, off_unal).statistic))
+        ratio_al.append(float(np.mean(off_al) / max(np.mean(raw), 1e-9)))
+        ratio_unal.append(float(np.mean(off_unal) / max(np.mean(raw), 1e-9)))
+        ks.append(int(len(w)))
+    return dict(
+        corr_aligned=float(np.mean(cors_al)),
+        corr_unaligned=float(np.mean(cors_unal)),
+        ratio_aligned=float(np.mean(ratio_al)),
+        ratio_unaligned=float(np.mean(ratio_unal)),
+        gmm_components=float(np.mean(ks)),
+    )
+
+
+def run_sweep(error_model: str, samples=(100, 200, 500, 1000)):
+    """Label-noise sensitivity sweep over per-frame IOF sample counts (M8).
+
+    One seed per count; reports the mlp-full / ridge / persistence metrics
+    plus the gate verdict at each count -> reports/samples_sweep.json.
+    """
+    print("\n================ LABEL-NOISE SENSITIVITY SWEEP (M8) ================")
+    t0 = time.time()
+    out = {}
+    for ns in samples:
+        gen = partial(generate_sequence, error_model=error_model, num_samples=ns)
+        res, _, _, _, _ = run_seed_full(0, gen)
+        rmse = lambda n: next(r["rmse"] for r in res if r["name"] == n)  # noqa: E731
+        auroc = lambda n: next(r["auroc"] for r in res if r["name"] == n)  # noqa: E731
+        wauroc = lambda n: next(r["wauroc"] for r in res if r["name"] == n)  # noqa: E731
+        g1 = rmse("mlp full") < rmse("ridge (same features)") and \
+            auroc("mlp full") > auroc("ridge (same features)")
+        g3 = rmse("mlp motion+depth") < rmse("mlp motion-only") and \
+            auroc("mlp motion+depth") > auroc("mlp motion-only")
+        out[str(ns)] = dict(
+            full_rmse=float(rmse("mlp full")),
+            full_auroc=float(auroc("mlp full")),
+            full_wauroc=float(wauroc("mlp full")),
+            ridge_rmse=float(rmse("ridge (same features)")),
+            persistence_rmse=float(rmse("persistence (oracle)")),
+            g1="PASS" if g1 else "FAIL",
+            g3="PASS" if g3 else "FAIL",
+        )
+        print(f"num_samples={ns:<5} full RMSE {out[str(ns)]['full_rmse']:.3f} "
+              f"wAUROC {out[str(ns)]['full_wauroc']:.3f} "
+              f"G1 {out[str(ns)]['g1']}  G3 {out[str(ns)]['g3']}")
+    path = ROOT / "reports" / "samples_sweep.json"
+    with open(path, "w") as f:
+        json.dump(dict(error_model=error_model, samples=list(samples), rows=out), f, indent=2)
+    print(f"\nsamples sweep -> {path} ({time.time() - t0:.0f}s)")
 
 
 def classical_covariance_forecast(X, k: int = 5, h: int = 5) -> np.ndarray:
