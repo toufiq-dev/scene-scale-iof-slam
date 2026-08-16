@@ -14,6 +14,25 @@ runtime setting of the thesis:
   function of the true error;
 * the IOF target computed offline from the TRUE error and TRUE depth.
 
+Review-driven realism (round 2):
+
+* **Estimated motion by default** (``motion_source="estimated"``): the model
+  no longer receives true camera motion. The generator composes an accumulated
+  estimated trajectory ``T_hat = T_gt (x) T_err`` (error in the local frame)
+  and derives the estimated relative motion from ``inv(T_hat[t-1]) @ T_hat[t]``,
+  exactly the quantity a running SLAM exposes. ``motion_source="true"`` keeps
+  the pre-review behavior for comparison.
+* **Degraded reliability variants** (``reliability_mode``): clean / noisy /
+  delayed / miscalibrated / masked / intermittent -- the review's concern that
+  ``conf = exp(-5*err)`` is unrealistically informative. The stress matrix
+  (``scripts/run_feasibility.py --stress``) re-runs the gates under each.
+* **Abrupt jump failures** (``jump_prob``, ``jump_scale``): real SLAM fails
+  abruptly (motion blur, textureless walls, relocalization jumps), not only by
+  smooth AR(1) drift; jumps are essential for warning-lead-time evaluation.
+* **Realistic depth corruption** (``depth_corruption="realistic"``): holes
+  (far-plane defaults), flying pixels and specular near-spikes on top of the
+  Gaussian noise.
+
 Design notes vs. the original scene-scale.ipynb:
   - motion is informative (smoothly varying forward speed + rotation bursts),
     not an almost-constant scalar;
@@ -38,7 +57,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .iof import compute_iof
+from .iof import compute_iof, log_so3, se3_to_T
 
 # Scene-scale choices span near object-scanning to far outdoor, mirroring
 # Princeton365's mix (285/365 object-scanning sequences at sub-meter scale).
@@ -47,6 +66,41 @@ DEPTH_CORR = 0.95      # scene-depth temporal correlation
 POSE_CORR = 0.90       # AR(1) coefficient of the hidden error process
 CONFIDENCE_NOISE = 0.15  # relative observation noise of the reliability signal
 ROT_INNOV_WEIGHT = 0.3   # rotation-innovation scale relative to translation
+RELIABILITY_MODES = ("clean", "noisy", "delayed", "miscalibrated", "masked",
+                     "intermittent")
+
+
+def _apply_reliability_mode(conf: np.ndarray, mode: str, rng: np.random.RandomState,
+                            delay: int = 3, every: int = 5, noise: float = 0.6) -> np.ndarray:
+    """Post-process the clean reliability signal into a degraded variant.
+
+    * clean        -- as generated (noisy observation of the error state)
+    * noisy        -- much larger observation noise (signal still biased)
+    * delayed      -- lagged by ``delay`` frames (stale observation)
+    * miscalibrated-- inverted: confidence reads HIGH when the error is high
+                      (a wrongly-calibrated sensor; a robust model must
+                      re-learn the mapping)
+    * masked       -- constant 0.5: no error-state information at all
+    * intermittent -- available only every ``every``-th frame
+    """
+    conf = np.asarray(conf, dtype=np.float64)
+    if mode == "clean":
+        return conf
+    if mode == "noisy":
+        return np.clip(conf * (1.0 + noise * rng.randn(len(conf))), 0.0, 1.0)
+    if mode == "delayed":
+        out = np.full_like(conf, 0.5)
+        out[delay:] = conf[:-delay]
+        return out
+    if mode == "miscalibrated":
+        return np.clip(1.0 - conf, 0.0, 1.0)
+    if mode == "masked":
+        return np.full_like(conf, 0.5)
+    if mode == "intermittent":
+        out = np.full_like(conf, 0.5)
+        out[::every] = conf[::every]
+        return out
+    raise ValueError(f"unknown reliability_mode {mode!r} (choices: {RELIABILITY_MODES})")
 
 
 def generate_sequence(
@@ -54,6 +108,11 @@ def generate_sequence(
     base_depth: float | None = None,
     seed: int = 0,
     error_model: str = "decoupled",
+    motion_source: str = "estimated",
+    reliability_mode: str = "clean",
+    jump_prob: float = 0.0,
+    jump_scale: float = 3.0,
+    depth_corruption: str = "gaussian",
 ) -> dict:
     """Generate one synthetic sequence with runtime features and IOF targets.
 
@@ -66,11 +125,23 @@ def generate_sequence(
             "coupled" (legacy; error scale also grows with 1/depth, entangling
             motion and depth -- kept for comparison; the archived pre-fix run
             used the original generator constants).
+        motion_source: "estimated" (default; relative motion derived from an
+            accumulated estimated trajectory whose pose error corrupts it --
+            the faithful runtime setting) or "true" (pre-review behavior,
+            clean true motion, kept for comparison).
+        reliability_mode: one of RELIABILITY_MODES (see
+            ``_apply_reliability_mode``). Default "clean".
+        jump_prob: per-frame probability of an abrupt error jump (0 = no
+            jumps, the smooth AR(1) process only).
+        jump_scale: jump magnitude relative to the per-frame innovation scale.
+        depth_corruption: "gaussian" (default) or "realistic" (adds holes,
+            flying pixels and specular near-spikes to the estimated depth).
 
     Returns a dict with arrays of shape (T, ...):
-        motion       (T, 6)  |translation|, |rotation| per frame (runtime input)
+        motion       (T, 6)  |translation|, |rotation| of the ESTIMATED
+                             relative motion per frame (runtime input)
         depth_stats  (T, 4)  median, q25, q75, std of the *estimated* depth
-        confidence   (T, 1)  noisy reliability signal (runtime input)
+        confidence   (T, 1)  (possibly degraded) reliability signal (runtime)
         iof          (T,)    true induced optical flow (offline target)
         trans_err_mag (T,)   true translation-error magnitude (train-time only)
         rot_err_mag   (T,)   true rotation-error magnitude (train-time only)
@@ -78,6 +149,14 @@ def generate_sequence(
     """
     if error_model not in ("coupled", "decoupled"):
         raise ValueError(f"error_model must be 'coupled' or 'decoupled', got {error_model!r}")
+    if motion_source not in ("true", "estimated"):
+        raise ValueError(f"motion_source must be 'true' or 'estimated', got {motion_source!r}")
+    if reliability_mode not in RELIABILITY_MODES:
+        raise ValueError(f"reliability_mode must be one of {RELIABILITY_MODES}, "
+                         f"got {reliability_mode!r}")
+    if depth_corruption not in ("gaussian", "realistic"):
+        raise ValueError(f"depth_corruption must be 'gaussian' or 'realistic', "
+                         f"got {depth_corruption!r}")
     rng = np.random.RandomState(seed)
     if base_depth is None:
         base_depth = float(rng.choice(DEPTH_CHOICES))
@@ -85,6 +164,11 @@ def generate_sequence(
     rot_err = np.zeros(3, dtype=np.float64)
     depth_base = base_depth
     speed = 0.05
+    # accumulated trajectories for the estimated-motion model:
+    #   T_gt_cum[t] = T_gt_cum[t-1] (x) T_rel_true[t]
+    #   T_hat_cum[t] = T_gt_cum[t] (x) T_err[t]   (error in the local frame)
+    T_gt_cum = np.eye(4, dtype=np.float64)
+    T_hat_prev = np.eye(4, dtype=np.float64)
 
     xs = np.linspace(-1, 1, 256)
     ys = np.linspace(-1, 1, 256)
@@ -99,6 +183,7 @@ def generate_sequence(
         "rot_err_mag": [],
         "median": [],
     }
+    conf_clean = []
 
     for t in range(seq_len):
         # --- ground-truth scene depth (slowly drifting, spatially structured) ---
@@ -129,31 +214,57 @@ def generate_sequence(
             error_scale = 0.005 + 0.05 * motion_mag * depth_factor
         trans_err = POSE_CORR * trans_err + error_scale * rng.randn(3)
         rot_err = POSE_CORR * rot_err + (error_scale * ROT_INNOV_WEIGHT) * rng.randn(3)
+
+        # --- abrupt jump failures (motion blur, relocalization events) ---
+        if jump_prob > 0.0 and rng.rand() < jump_prob:
+            trans_err = trans_err + jump_scale * error_scale * rng.randn(3)
+            rot_err = rot_err + jump_scale * error_scale * ROT_INNOV_WEIGHT * rng.randn(3)
         err_mag = np.linalg.norm(trans_err)
 
         # --- corrupted estimated depth (GIGO): input side degrades with error ---
         corruption = rng.randn(256, 256) * (err_mag * 5.0)
         D_est = np.maximum(D + corruption, 0.5)
+        if depth_corruption == "realistic":
+            holes = rng.rand(256, 256) < 0.05          # far-plane defaults
+            D_est[holes] = 50.0
+            flying = rng.rand(256, 256) < 0.02         # flying pixels (spikes)
+            D_est[flying] += depth_base * 5.0 * np.abs(rng.randn())
+            spec = rng.rand(256, 256) < 0.01           # specular near-spikes
+            D_est[spec] = 0.3
+        D_est = np.maximum(D_est, 0.5)
 
         # --- target: IOF from TRUE error + TRUE depth (offline GT) ---
-        from .iof import se3_to_T
-
         iof = compute_iof(se3_to_T(trans_err, rot_err), D, num_samples=200, seed=12345 + t)
 
         # --- runtime reliability signal: noisy observation of the error state ---
         noisy_err = err_mag * (1.0 + CONFIDENCE_NOISE * rng.randn())
-        confidence = float(np.exp(-5.0 * max(noisy_err, 0.0)))
+        conf_clean.append(float(np.exp(-5.0 * max(noisy_err, 0.0))))
+
+        # --- runtime motion feature: true relative motion, or the ESTIMATED
+        #     relative motion derived from the accumulated estimated trajectory
+        #     M_hat = inv(T_hat[t-1]) @ T_hat[t]  (corrupted by the pose error) ---
+        T_rel_true = se3_to_T(trans_true, rot_true)
+        T_gt_cum = T_gt_cum @ T_rel_true
+        T_hat_cum = T_gt_cum @ se3_to_T(trans_err, rot_err)
+        if motion_source == "estimated":
+            M_hat = np.linalg.inv(T_hat_prev) @ T_hat_cum
+            m_trans = np.abs(M_hat[:3, 3])
+            m_rot = np.abs(log_so3(M_hat[:3, :3]))
+        else:  # "true": pre-review behavior, clean true motion
+            m_trans = np.abs(trans_true)
+            m_rot = np.abs(rot_true)
+        T_hat_prev = T_hat_cum
 
         d = D_est.ravel()
-        rec["motion"].append(np.concatenate([np.abs(trans_true), np.abs(rot_true)]))
+        rec["motion"].append(np.concatenate([m_trans, m_rot]))
         rec["depth_stats"].append(
             [float(np.median(d)), float(np.percentile(d, 25)),
              float(np.percentile(d, 75)), float(np.std(d))]
         )
-        rec["confidence"].append(confidence)
         rec["iof"].append(iof)
         rec["trans_err_mag"].append(float(np.linalg.norm(trans_err)))
         rec["rot_err_mag"].append(float(np.linalg.norm(rot_err)))
         rec["median"].append(float(np.median(D)))
 
+    rec["confidence"] = _apply_reliability_mode(np.array(conf_clean), reliability_mode, rng)
     return {k: np.array(v, dtype=np.float64) for k, v in rec.items()}

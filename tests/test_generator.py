@@ -63,6 +63,93 @@ def test_invalid_error_model_raises():
     raise AssertionError("expected ValueError for unknown error_model")
 
 
+# --- round-2 review: estimated motion, degraded reliability, jumps, depth ----
+
+def test_estimated_motion_differs_from_true_and_stays_in_band():
+    # The model must consume ESTIMATED motion (corrupted by the pose error),
+    # not the true motion a running SLAM never sees.
+    s_est = generate_sequence(seq_len=60, seed=1, motion_source="estimated")
+    s_true = generate_sequence(seq_len=60, seed=1, motion_source="true")
+    assert not np.allclose(s_est["motion"], s_true["motion"])
+    # ...but the estimated motion remains a faithful, same-scale proxy of the
+    # true motion (the corruption is relative to the error magnitude).
+    assert np.allclose(s_est["motion"].mean(axis=0), s_true["motion"].mean(axis=0),
+                       atol=0.05)
+
+
+def test_estimated_motion_correlates_with_hidden_error():
+    # Estimated motion inherits the pose error dynamics: M_hat =
+    # inv(T_err[t-1]) . M_true . T_err[t], so the deviation from true motion
+    # is driven by the error INNOVATION |d(err)|, not the error magnitude.
+    # This pins that the corruption is not independent noise.
+    s_est = generate_sequence(seq_len=80, seed=12, motion_source="estimated")
+    s_true = generate_sequence(seq_len=80, seed=12, motion_source="true")
+    dev = np.linalg.norm(s_est["motion"] - s_true["motion"], axis=1)
+    d_err = np.abs(np.diff(np.concatenate([[0.0], s_est["trans_err_mag"]])))
+    assert float(np.corrcoef(dev, d_err)[0, 1]) > 0.3
+
+
+def test_reliability_masked_is_constant():
+    s = generate_sequence(seq_len=40, seed=2, reliability_mode="masked")
+    assert np.allclose(s["confidence"], 0.5)
+
+
+def test_reliability_delayed_lags_clean():
+    clean = generate_sequence(seq_len=60, seed=4, reliability_mode="clean")
+    delayed = generate_sequence(seq_len=60, seed=4, reliability_mode="delayed")
+    assert np.allclose(delayed["confidence"][3:], clean["confidence"][:-3], atol=1e-9)
+    assert np.allclose(delayed["confidence"][:3], 0.5)
+
+
+def test_reliability_miscalibrated_inverts_clean():
+    clean = generate_sequence(seq_len=60, seed=6, reliability_mode="clean")
+    mis = generate_sequence(seq_len=60, seed=6, reliability_mode="miscalibrated")
+    assert np.allclose(mis["confidence"], np.clip(1.0 - clean["confidence"], 0.0, 1.0),
+                       atol=1e-9)
+
+
+def test_reliability_intermittent_is_sparse():
+    s = generate_sequence(seq_len=60, seed=7, reliability_mode="intermittent")
+    known = s["confidence"] != 0.5
+    assert known.sum() == 12  # every 5th of 60 frames
+    # the kept frames carry the real (non-trivial) signal
+    assert not np.allclose(s["confidence"][::5], 0.5)
+
+
+def test_jump_failures_produce_abrupt_spikes():
+    s = generate_sequence(seq_len=300, seed=8, jump_prob=0.08, jump_scale=5.0)
+    d = np.abs(np.diff(s["trans_err_mag"]))
+    assert d.max() > 5.0 * np.median(d[d > 0])  # at least one jump dominates
+    # without jumps the AR(1) process is smooth: no such spike
+    s0 = generate_sequence(seq_len=300, seed=8, jump_prob=0.0)
+    d0 = np.abs(np.diff(s0["trans_err_mag"]))
+    assert d0.max() < 5.0 * np.median(d0[d0 > 0])
+
+
+def test_realistic_depth_corruption_degrades_depth_stats():
+    a = generate_sequence(seq_len=30, seed=10, depth_corruption="gaussian", base_depth=5.0)
+    b = generate_sequence(seq_len=30, seed=10, depth_corruption="realistic", base_depth=5.0)
+    # holes (far-plane defaults) and spikes inflate the std of the estimated
+    # depth stats the model consumes
+    assert b["depth_stats"][:, 3].mean() > a["depth_stats"][:, 3].mean()
+
+
+def test_invalid_motion_source_raises():
+    try:
+        generate_sequence(seq_len=10, seed=0, motion_source="nope")
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError for unknown motion_source")
+
+
+def test_invalid_reliability_mode_raises():
+    try:
+        generate_sequence(seq_len=10, seed=0, reliability_mode="nope")
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError for unknown reliability_mode")
+
+
 if __name__ == "__main__":
     import traceback
 

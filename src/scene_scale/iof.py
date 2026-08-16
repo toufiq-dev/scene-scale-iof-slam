@@ -9,7 +9,30 @@ Reference semantics (Princeton365):
     IOF = E_{t,d,u,v} || flow(t, d, u, v) ||_2
 where the per-pixel flow is the displacement caused by transforming scene
 points with the relative transformation between the estimated and the
-ground-truth camera pose, T_rel = T_est^{-1} * T_gt.
+ground-truth camera pose.
+
+Pose convention (explicit, matches Princeton365 -- review fix, Critical
+Issue 1).
+
+    T_wc maps camera coordinates to world coordinates. The estimated pose
+    T_hat = T_hat_wc and the ground-truth pose T_gt = T_gt_wc are both
+    world-to-camera maps. A scene point P_c in the GT camera frame maps into
+    the estimated camera frame by
+
+        P'_c = (T_hat_wc)^{-1} T_gt_wc P_c = T_rel P_c,
+
+    i.e.  T_rel = inv(T_est) @ T_gt  (``relative_error_pose``). The induced
+    flow of a pixel is the reprojection displacement || pi(T_rel P) - p ||_2,
+    and IOF is its expectation over frames, depth and pixels.
+
+    Equivalently, T_rel is the SE(3) correction that carries the GT
+    trajectory onto the estimated trajectory, expressed in the estimated
+    frame -- the pose error AS SEEN BY THE CAMERA, which is what determines
+    the visual consequence. Swapping est/gt yields inv(T_rel): the flow
+    magnitudes are equal for pure rotations and near-equal for small errors
+    (unit test ``test_relative_error_pose_inverse_swap`` pins this), but the
+    convention is fixed -- it must match the official Princeton365 target
+    generation (pilot gate P1-G1, rho > 0.98, Section 8.8 of the proposal).
 """
 
 from __future__ import annotations
@@ -53,6 +76,18 @@ def se3_to_T(trans: np.ndarray, rot: np.ndarray) -> np.ndarray:
     T[:3, 3] = np.asarray(trans, dtype=np.float64)
     T[:3, :3] = exp_so3(np.asarray(rot, dtype=np.float64))
     return T
+
+
+def log_so3(R: np.ndarray) -> np.ndarray:
+    """Inverse Rodrigues: axis-angle vector from a rotation matrix."""
+    R = np.asarray(R, dtype=np.float64)
+    cos_a = float(np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0))
+    theta = np.arccos(cos_a)
+    if theta < 1e-9:
+        return np.zeros(3, dtype=np.float64)
+    w = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]],
+                 dtype=np.float64)
+    return (theta / (2.0 * np.sin(theta))) * w
 
 
 def relative_error_pose(T_est: np.ndarray, T_gt: np.ndarray) -> np.ndarray:

@@ -1,14 +1,13 @@
 # Synthetic Feasibility Study — Report
 
-*Generated from `scripts/run_feasibility.py` (3 seeds, **depth-decoupled error model**). Full
-per-seed numbers: `reports/feasibility_results.json`. Pre-fix (coupled) run:
-`reports/feasibility_results_coupled.json`. Archived original (unfixed) study:
-`experiments/feasibility_fixed/fixed_feasibility.py`.*
+*Generated from `scripts/run_feasibility.py` (3 seeds, **depth-decoupled error model, estimated motion**).
+Full per-seed numbers: `reports/feasibility_results.json`. Pre-fix (coupled, true-motion) run:
+`reports/feasibility_results_coupled.json`. Round-1 (decoupled, true-motion) run:
+`reports/feasibility_results_true_motion.json`. Stress matrix: `reports/stress_results.json`.
+Archived original (unfixed) study: `experiments/feasibility_fixed/fixed_feasibility.py`.*
 
-**Verdict: ALL GATES PASS (G1–G5) — the G3 confound is fixed.** The corrected synthetic task now
-demonstrates, end to end, that scene geometry adds measurable value to visual-error prediction when
-depth enters the target the way it does in reality (through the IOF 1/Z projection), while the
-pose-error dynamics stay motion-driven.
+**Verdict: ALL GATES PASS (G1–G6) under the more realistic round-2 generator — the scene-scale claim
+(G3) survives every input-realism stress test.**
 
 ## 1. The original study's verdict (why it failed)
 
@@ -31,23 +30,29 @@ AUROC (0.722 vs 0.680). Root causes, established by code inspection:
 claimed "resounding success" was still wrong, because it ignored its own failing gate. Both errors are
 corrected here: the design, and the reporting.
 
-## 2. Corrected design
+## 2. Corrected design (rounds 1 + 2)
 
 | Fix | Implementation |
 |---|---|
-| Fair baseline | Ridge trained on the **same features** as the learned model |
+| Fair baseline | Ridge trained on the **same features** as the learned model; oracle persistence separated from runtime-available baselines (B1–B9) |
 | Reliability signal as input | Noisy observation of the error state: `conf = exp(-5·‖err‖·(1+0.15·ε))` — deliberately not deterministic (GIGO-safe) |
-| Informative motion | Smoothly varying forward speed + 6% rotation bursts; 6-DoF magnitudes |
+| **Estimated motion** (round 2) | The model consumes relative motion derived from an **accumulated estimated trajectory** `T̂ = T_gt ∘ T_err` — corrupted by the pose error, as a running SLAM exposes; `motion_source="true"` kept for comparison |
+| Degraded reliability (round 2) | Stress variants: delayed / noisy / miscalibrated / masked / intermittent (§6) |
+| Abrupt jump failures (round 2) | Poisson error jumps (`jump_prob`, `jump_scale`) for warning-lead-time realism |
+| Realistic depth corruption (round 2) | Holes (far-plane defaults), flying pixels, specular near-spikes on the estimated depth |
 | h=0 stage | Current-error estimation (SEESys-style) run alongside h=5 |
 | Analytic two-stage | MLP forecasts of error magnitudes + depth, then explicit projection transform + linear calibration |
+| **Classical covariance propagation** | AR(1) forecast covariance → analytic IOF Jacobian → image space, using ONLY runtime quantities (blind baseline) |
+| **GRU temporal baseline** | Learned temporal model on the same features (fairer than MLP-alone) |
 | **Depth-decoupled error model** (G3 fix) | Pose-error scale depends on **motion only**; scene depth enters **only** through the IOF 1/Z target (see §3) |
 | **Scene-scale-faithful depth range** (G3 fix) | `DEPTH_CHOICES = (0.5 … 30 m)`, mirroring Princeton365's 285/365 sub-meter scanning sequences; rotation-innovation weight 0.3 (see §3) |
+| **Failure definitions** (round 2) | Global τ, per-sequence τ_s (**within-sequence AUROC = PRIMARY**), robust z-score, depth-normalized IOF (§5) |
 | Rigor | Per-sequence Spearman/AUROC, 3 seeds, mean ± std, unseen test sequences |
 
 ## 3. The G3 confound, and the two-part fix
 
-**Gate G3 asks: does the depth input add value beyond motion?** The pre-fix generator failed this gate
-not for one but two compounding reasons:
+**Gate G3 asks: does the depth input add value beyond motion, with the reliability signal masked?**
+The pre-fix generator failed this gate not for one but two compounding reasons:
 
 **(a) The error model coupled motion and depth.** `error_scale = 0.005 + 0.05·motion/Z` — depth
 polluted the pose-error dynamics themselves, so "depth" could not be isolated, and motion-only models
@@ -77,69 +82,153 @@ is 285/365 object-scanning at sub-meter scale) and a realistic rotation-innovati
 IOF now spans **5×**, and depth's geometric signal is material.
 
 With both fixes, the learned model's depth input pays off on both legs across all three seeds
-(§4): RMSE −35%, pooled AUROC +0.016. **The confound is gone; G3 is now a meaningful test.**
+(§4): RMSE −35%, pooled AUROC +0.017. **The confound is gone; G3 is now a meaningful test.**
 
-## 4. Results (test on unseen sequences, 3 seeds, decoupled generator)
+## 4. Results (test on unseen sequences, 3 seeds, decoupled + estimated-motion generator)
 
-| model | RMSE | medSpearman | AUROC | medAUROC | AP |
-|---|---|---|---|---|---|
-| constant | 4.209 ± 0.321 | — | 0.500 | 0.500 | 0.263 |
-| naive-shift (context) | 3.446 ± 0.067 | 0.116 | 0.886 | 0.589 | 0.718 |
-| ridge (same features) | 3.624 ± 0.192 | 0.113 | 0.881 | 0.594 | 0.641 |
-| mlp motion-only | 1.731 ± 0.066 | 0.624 | 0.972 | 0.934 | 0.940 |
-| mlp motion+depth | 1.130 ± 0.054 | 0.715 | 0.988 | 0.958 | 0.970 |
-| **mlp full** | **0.993 ± 0.073** | **0.752** | **0.991** | **0.975** | **0.976** |
-| analytic 2-stage (phys-explicit) | 1.953 ± 0.058 | 0.658 | 0.965 | 0.866 | 0.899 |
-| mlp full h=0 (current) | 0.830 ± 0.073 | 0.800 | 0.994 | 0.980 | 0.985 |
+| model | RMSE | nRMSE | medSpearman | AUROC (pooled) | **wAUROC (within-seq)** | AP |
+|---|---|---|---|---|---|---|
+| constant | 4.209 ± 0.321 | 1.833 | — | 0.500 | 0.500 | 0.263 |
+| persistence (oracle, B1) | 3.446 ± 0.067 | 1.302 | 0.116 | 0.886 | 0.549 | 0.718 |
+| ridge (same features, B5) | 3.626 ± 0.194 | 1.658 | 0.125 | 0.880 | 0.519 | 0.648 |
+| classical cov-prop (blind, B7) | 2.826 ± 0.034 | 1.066 | 0.032 | 0.918 | 0.509 | 0.761 |
+| gru (temporal, B9) | 1.323 ± 0.095 | 0.824 | 0.566 | 0.981 | 0.638 | 0.957 |
+| mlp motion-only | 1.729 ± 0.092 | 0.856 | 0.666 | 0.971 | 0.721 | 0.939 |
+| mlp motion+depth | 1.124 ± 0.022 | 0.719 | 0.683 | 0.988 | 0.672 | 0.970 |
+| **mlp full** | **0.948 ± 0.057** | **0.646** | **0.792** | **0.992** | **0.688** | **0.981** |
+| analytic 2-stage (phys-explicit, B8) | 1.914 ± 0.055 | 0.798 | 0.676 | 0.966 | 0.637 | 0.903 |
+| mlp full h=0 (current, B6) | 0.798 ± 0.059 | 0.570 | 0.826 | 0.995 | 0.688 | 0.988 |
 
-Scene-scale split (test sequences grouped by true median depth):
+wAUROC = pooled AUROC under per-sequence thresholds τ_s = Q₇₅(IOF_s) — the **primary** early-warning
+metric (cannot be gamed by detecting scene scale). Three honest observations:
 
-| group | med depth | ridge RMSE | mlp RMSE | naive RMSE |
+* **Classical blind covariance propagation is the strongest classical baseline** (RMSE 2.826, pooled
+  AUROC 0.918 — it beats ridge and oracle persistence on both, because it is scene-scale-aware via
+  the 1/Z Jacobian) — **yet it is chance within-sequence (0.509)**: it never observes the error
+  realization. This is exactly why the learned model matters and why within-sequence AUROC is the
+  primary metric.
+* **The GRU (B9) does not beat the MLP** (1.323 vs 0.948): the contribution is the task formulation,
+  not the architecture.
+* **Depth is a between-sequence signal**: within-sequence, motion-only's wAUROC (0.721) slightly
+  exceeds motion+depth's (0.672) because depth statistics are nearly constant inside a sequence.
+  Depth's value is cross-sequence (scene-scale), captured by RMSE and pooled AUROC; both views are
+  reported and G3 gates on the between-sequence legs.
+
+### 4.1 Input-combination ablation (reviewer-required matrix)
+
+| Inputs | RMSE | AUROC (pooled) | wAUROC |
+|---|---|---|---|
+| motion only | 1.729 | 0.971 | 0.721 |
+| depth only | 2.701 | 0.924 | 0.510 |
+| reliability only | 4.075 | 0.633 | 0.565 |
+| motion + depth | 1.124 | 0.988 | 0.672 |
+| motion + reliability | 1.468 | 0.982 | 0.717 |
+| depth + reliability | 2.568 | 0.934 | 0.531 |
+| **full** | **0.948** | **0.992** | **0.688** |
+
+*Motion+depth vs motion-only* (both WITHOUT reliability) is the **reliability-masked depth test**
+(G3): RMSE −35%, pooled AUROC 0.988 vs 0.971. *Full vs motion+reliability* (G6): depth still adds
+value with reliability present (0.948 vs 1.468).
+
+### 4.2 Failure-definition comparison (mlp full; pooled AUROC, mean over seeds)
+
+| Definition | AUROC |
+|---|---|
+| Global threshold (τ = Q₇₅ train) | 0.992 |
+| **Per-sequence threshold τ_s (PRIMARY)** | **0.688** |
+| Robust z-score (z > 1.5, per-sequence) | 0.810 |
+| Depth-normalized (IOF·Ẑ_med) | 0.251 |
+
+The global number is inflated by between-sequence depth differences (near scenes are simply "worse").
+The depth-normalized number is a diagnostic caveat: normalizing IOF by Ẑ also rescales the
+*depth-invariant rotation term* by Ẑ, so with the synthetic rotation weight the raw-IOF predictor's
+cross-sequence ranking inverts; within-sequence metrics are invariant to the rescaling (a per-sequence
+constant multiple). To be resolved against the official Flow-AUC protocol on real data (P1-G1), not a
+claim about the predictor.
+
+### 4.3 Scene-scale split (test, by true median depth)
+
+| group | med depth | ridge RMSE | mlp RMSE | persistence RMSE |
 |---|---|---|---|---|
-| near | 0.81 m | 5.216 | **1.154** | 5.367 |
-| medium | 4.44 m | 2.778 | **0.990** | 2.275 |
-| far | 18.15 m | 2.071 | **0.800** | 1.188 |
-
-The depth-augmented model now tracks the near-scene regime (where Princeton365 concentrates its
-object-scanning sequences) far better than the baselines: near-scene RMSE 1.154 vs 5.2–5.4 for ridge
-and naive-shift.
+| near | 0.81 m | 5.214 | **1.079** | 5.367 |
+| medium | 4.44 m | 2.782 | **0.951** | 2.275 |
+| far | 18.15 m | 2.083 | **0.791** | 1.188 |
 
 ## 5. Gates (≥2 of 3 seeds)
 
-* G1 learned > linear on same features — **PASS** (RMSE 0.993 vs 3.624; AUROC 0.991 vs 0.881)
-* G2 reliability signal adds value — **PASS** (full vs motion+depth: RMSE 0.993 vs 1.130)
-* G3 geometry (depth) adds value — **PASS** (motion+depth vs motion-only: RMSE 1.130 vs 1.731,
-  **−35%**; pooled AUROC 0.988 vs 0.972 — both legs, all seeds). *Pre-fix: PARTIAL (AUROC leg failed
-  on the two-part confound of §3).*
-* G4 beats naive shift — **PASS** (RMSE 0.993 vs 3.446; AUROC 0.991 vs 0.886)
-* G5 current-error estimation works (h=0) — **PASS** (RMSE 0.830 vs constant 4.209)
+* G1 learned > linear on same features — **PASS** (RMSE 0.948 vs 3.626; AUROC 0.992 vs 0.880)
+* G2 reliability signal adds value — **PASS** (full vs motion+depth: RMSE 0.948 vs 1.124)
+* G3 depth adds value with reliability **MASKED** — **PASS** (motion+depth vs motion-only: RMSE 1.124
+  vs 1.729, **−35%**; pooled AUROC 0.988 vs 0.971 — both legs, all seeds). *Pre-fix: PARTIAL (AUROC
+  leg failed on the two-part confound of §3).*
+* G4 beats oracle persistence — **PASS** (RMSE 0.948 vs 3.446; AUROC 0.992 vs 0.886) — the original
+  failure is resolved
+* G5 current-error estimation works (h=0) — **PASS** (RMSE 0.798 vs constant 4.209)
+* G6 depth adds value with reliability **PRESENT** (reported) — **PASS** (full vs motion+reliability:
+  0.948 vs 1.468)
 
 Overall (G1 ∧ G2 ∧ G3 ∧ G5): **PASS** — the pre-fix `PARTIAL/FAIL` (archived in
-`feasibility_results_coupled.json`) is resolved.
+`feasibility_results_coupled.json`) is resolved, now under the more realistic estimated-motion
+generator.
 
-## 6. Interpretation and what it does NOT prove
+## 6. Stress matrix (1 seed each; `reports/stress_results.json`)
 
-**Supported.** With runtime-available error-state information (motion + noisy reliability), the learned
-predictor beats persistence on RMSE and rank metrics (G4), beats a linear model on identical features
-(G1), the reliability signal adds value (G2), and scene geometry adds value through the geometric 1/Z
-scaling (G3) — with the depth-decoupled error model guaranteeing that the depth channel is tested
-purely on the image-space consequence, not on a generator artifact. The protocol — per-sequence
-metrics, persistence baseline, fair linear baseline — is now trustworthy.
+| Variant | full RMSE | wAUROC | G1 | G2 | G3 | G5 |
+|---|---|---|---|---|---|---|
+| baseline (estimated motion) | 1.029 | 0.715 | PASS | PASS | PASS | PASS |
+| true motion (pre-fix input) | 1.095 | 0.704 | PASS | PASS | PASS | PASS |
+| reliability: delayed (3 frames) | 1.053 | 0.707 | PASS | PASS | PASS | PASS |
+| reliability: noisy | 0.965 | 0.711 | PASS | PASS | PASS | PASS |
+| reliability: miscalibrated | 1.005 | 0.710 | PASS | PASS | PASS | PASS |
+| reliability: masked | 1.232 | 0.693 | PASS | **FAIL** | PASS | PASS |
+| reliability: intermittent | 1.052 | 0.704 | PASS | PASS | PASS | PASS |
+| jump failures | 1.275 | 0.701 | PASS | **FAIL** | PASS | PASS |
+| realistic depth corruption | 1.013 | 0.680 | PASS | PASS | PASS | PASS |
+
+Findings:
+
+* **G3 — the scene-scale claim — survives every degradation**, including masked reliability and
+  realistic depth corruption. The depth channel does not lean on an idealized reliability signal.
+* **G2 fails exactly where the reliability signal is genuinely unusable**: masked (no information by
+  construction) and jump failures (a smooth `confidence ≈ exp(−5·‖err‖)` observation cannot
+  anticipate an abrupt within-horizon jump). A model can only extract value from a signal that carries
+  it; the real-data analogue is that reliability helps predict smooth drift, not sudden relocalization
+  jumps — which is precisely why the drift-vs-jump decomposition and lead-time evaluation (§8.7 of the
+  proposal, R2) are mandatory on real data.
+* Estimated vs true motion barely moves any gate (baseline 1.029 vs true-motion 1.095 RMSE): the
+  round-1 conclusions were not an artifact of clean motion input.
+
+## 7. Interpretation and what it does NOT prove
+
+**Supported.** With runtime-available error-state information (estimated motion + noisy reliability),
+the learned predictor beats oracle persistence and a linear model on identical features (G4, G1), the
+reliability signal adds value (G2), and scene geometry adds value through the geometric 1/Z scaling
+(G3) with the reliability signal masked — with the depth-decoupled error model guaranteeing that the
+depth channel is tested purely on the image-space consequence, not on a generator artifact. The
+protocol — oracle-vs-runtime baseline split, per-sequence/within-sequence metrics, persistence
+baseline, fair linear baseline, temporal baseline, classical propagation — is now trustworthy and
+stress-tested.
 
 **Not supported / to be re-tested on real data.**
 
 1. The synthetic task is comparatively easy: the generator makes IOF strongly determined by runtime
    features (AUROC ≈ 0.99 for the full model). Real DROID-SLAM error dynamics (drift, relocalization
-   jumps) will be harder and will test the forecasting claim honestly.
-2. G3 now passes in-silico, but the *magnitude* of depth's value (and whether the model's predicted
-   IOF-vs-depth relationship matches the analytic 1/Z scaling at matched pose-error regime) must be
-   confirmed on Princeton365's real ZED depth and error statistics — the synthetic range was chosen
-   to mirror the dataset, but only the dataset can validate it.
-3. The explicit physics two-stage is *worse* than direct regression in-silico (1.953 vs 0.993). This
+   jumps) will be harder and will test the forecasting claim honestly — the jump-failure stress
+   variant is a first, partial probe of this.
+2. G3 now passes in-silico (with and without reliability), but the *magnitude* of depth's value (and
+   whether the model's predicted IOF-vs-depth relationship matches the analytic 1/Z scaling at matched
+   pose-error regime) must be confirmed on Princeton365's real ZED depth and error statistics — the
+   synthetic range was chosen to mirror the dataset, but only the dataset can validate it (pilot gates
+   P1-G1, P1-G4, P1-G5).
+3. The explicit physics two-stage is *worse* than direct regression in-silico (1.914 vs 0.948). This
    is a genuine, reportable negative for the "differentiable projection layer" hypothesis — it becomes
    an experimental question on real data, not a design assumption.
+4. Within-sequence AUROC is the honest early-warning metric, and depth's value is a *between-sequence*
+   (scene-scale) property: the two views must both be reported on real data, and failure-event counts
+   within GT-posed segments must be quantified before Phase 3 (proposal §8.8, P1-G3).
 
-**Recommended next step:** proceed to the staged Princeton365 pilot (Phase 1 of the proposal) with the
-persistence baseline and per-sequence metrics mandatory in every table. The generator's G3 confound is
-fixed in this iteration; the real-data pilot is the place where the depth-scaling hypothesis (H2) gets
-its decisive test.
+**Recommended next step:** proceed to the staged Princeton365 pilot (Phase 1 of the proposal) governed
+by the pre-registered gates P1-G1…P1-G7 — starting with official-IOF reproduction (ρ > 0.98) and the
+failure-event-count analysis — with the persistence baseline and per-sequence metrics mandatory in
+every table. The generator's G3 confound is fixed and the input realism is stress-tested; the real-data
+pilot is where the depth-scaling hypothesis (H2) gets its decisive test.

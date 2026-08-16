@@ -57,13 +57,30 @@ def build_windows(seq: dict, k: int = 5, h: int = 5):
 
 
 def feature_masks(k: int = 5, d: int = 4):
-    """Column indices for input ablations: motion-only, motion+depth, full."""
+    """Column indices for the FULL input-combination ablation matrix.
+
+    Column layout of each window: [motion(6k) | reliability(k) | depth(d)].
+    Returns a dict with all 7 combinations of {motion, reliability, depth}.
+    The reviewer-requested table (inputs x RMSE / per-seq Spearman / AUROC /
+    AP) uses exactly these masks, including the reliability-masked comparison
+    (motion-only vs motion+depth, both WITHOUT reliability) that tests whether
+    depth carries the scene-scale claim on its own.
+    """
     m = 6 * k
     c = k
     full = np.arange(m + c + d)
-    motion_only = np.arange(m)
-    motion_depth = np.concatenate([np.arange(m), np.arange(m + c, m + c + d)])
-    return full, motion_only, motion_depth
+    motion = np.arange(m)
+    rel = np.arange(m, m + c)
+    depth = np.arange(m + c, m + c + d)
+    return dict(
+        full=full,
+        motion=motion,
+        depth=depth,
+        rel=rel,
+        motion_depth=np.concatenate([motion, depth]),
+        motion_rel=np.concatenate([motion, rel]),
+        depth_rel=np.concatenate([depth, rel]),
+    )
 
 
 def build_dataset(n_train, n_val, n_test, seq_len, k, h, seed0, generator):

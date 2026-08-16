@@ -1,9 +1,10 @@
 # Related Work — Annotated Review
 
 *Compiled via live systematic literature search, August 2026. Status: every cluster below contains
-work that partially overlaps the thesis framing; the *narrow* novelty claim (future, scene-scale-aware,
-image-space IOF prediction with SLAM-available inputs) was not found in any published work as of this
-date. This document must be refreshed immediately before submission.*
+work that partially overlaps the thesis framing; to the best of our knowledge, the *narrow* novelty
+claim (future, scene-scale-aware, image-space IOF prediction with SLAM-available inputs) is not covered
+by any published work as of this date. This is a time-limited claim (Princeton365 is from ICCV 2025) and
+this document must be refreshed — re-running the search — immediately before submission.*
 
 ---
 
@@ -106,7 +107,8 @@ assumed away.
 ## 7. Generative / foundation-model geometry (adjacent, scoped)
 
 VGGT (Wang et al., CVPR 2025, best paper) — feed-forward camera/depth/point-map prediction; MASt3R-SLAM
-(Leroy et al., CVPR 2025) — real-time dense monocular SLAM from a pretrained 3D prior; DUSt3R family.
+(Murai, Dexheimer, Davison, CVPR 2025) — real-time dense monocular SLAM from a pretrained 3D prior;
+DUSt3R family.
 
 **Assessment / positioning.** These make geometry prediction almost free, which (a) strengthens the
 feasibility of our depth-statistics input and (b) invites the question "why not just use VGGT
@@ -120,13 +122,14 @@ consequence of SLAM uncertainty*, not engineering better geometry.
 
 | Criterion | Found in literature? |
 |---|---|
-| IOF / Flow AUC used as a supervised learning target | **No** (as of Aug 2026) |
-| h-step-ahead prediction of future visual degradation | **No** (SEESys/SUPER predict current risk; classical work predicts future *covariance*) |
+| IOF / Flow AUC used as a supervised learning target | **Not that we are aware of** (as of Aug 2026) |
+| h-step-ahead prediction of future visual degradation | **Not that we are aware of** (SEESys/SUPER predict current risk; classical work predicts future *covariance*) |
 | Inference restricted to SLAM-available quantities | Partially (SEESys, SUPER) — but with different targets |
-| Explicit comparison vs persistence + error propagation + oracle | **No** |
+| Explicit comparison vs persistence + error propagation + oracle | **Not that we are aware of** |
 | Downstream adaptive-SLAM use of an image-space reliability signal | Partially (Introspective-SLAM line — trajectory-level, RL) |
 
-**Bottom line:** the narrow gap (first two rows) is real but young (Princeton365 is from ICCV 2025).
-The defensible thesis formulation is: *future, scene-scale-aware, image-space visual-consequence
-prediction for SLAM, trained on mm-accurate GT, evaluated with the correct baselines.* Everything
-broader is prior art and must be cited.
+**Bottom line:** the narrow gap (first two rows) is real but young (Princeton365 is from ICCV 2025),
+and the claim is made defensively: *to the best of our knowledge, as of August 2026, no published work
+combines these properties*. The defensible thesis formulation is: *future, scene-scale-aware,
+image-space visual-consequence prediction for SLAM, trained on mm-accurate GT, evaluated with the
+correct baselines.* Everything broader is prior art and must be cited.

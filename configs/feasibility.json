@@ -1,6 +1,6 @@
 {
   "experiment": "synthetic-feasibility-fixed",
-  "description": "Corrected feasibility gate with the G3 confound fixed: learned predictor vs fair linear baseline, ablations, h=0 stage, analytic two-stage, per-sequence metrics, 3 seeds. Error model is depth-decoupled (depth enters only via the IOF 1/Z target), and scene-scale choices span near object-scanning to far outdoor like Princeton365.",
+  "description": "Corrected feasibility gate with the G3 confound fixed and round-2 review fixes applied: estimated (corrupted) motion by default, oracle vs runtime-available baselines, GRU + classical covariance-propagation baselines, per-sequence (within-sequence) failure thresholds as the primary early-warning metric, full input-combination ablation matrix, and a generator stress matrix (degraded reliability, jump failures, realistic depth corruption).",
   "seeds": [0, 1, 2],
   "data": {
     "n_train": 60,
@@ -11,8 +11,22 @@
   },
   "generator": {
     "error_model": "decoupled",
+    "motion_source": "estimated",
+    "reliability_mode": "clean",
+    "jump_prob": 0.0,
+    "depth_corruption": "gaussian",
     "depth_choices": [0.5, 0.8, 1.2, 2.0, 4.0, 8.0, 15.0, 30.0],
-    "rot_innov_weight": 0.3
+    "rot_innov_weight": 0.3,
+    "stress_variants": [
+      "true motion (pre-fix input)",
+      "reliability: delayed",
+      "reliability: noisy",
+      "reliability: miscalibrated",
+      "reliability: masked",
+      "reliability: intermittent",
+      "jump failures",
+      "realistic depth corruption"
+    ]
   },
   "windows": {
     "k": 5,
@@ -25,15 +39,39 @@
     "epochs": 60,
     "patience": 8,
     "lr": 0.001,
-    "batch": 256
+    "batch": 256,
+    "temporal_baseline": {
+      "kind": "gru",
+      "hidden": 64,
+      "epochs": 150,
+      "patience": 12,
+      "lr": 0.003
+    }
   },
   "baselines": [
     "constant",
-    "naive-shift (context)",
+    "persistence (oracle)",
     "ridge (same features)",
-    "analytic 2-stage (phys-explicit)"
+    "classical cov-prop (blind)",
+    "gru (temporal, same features)",
+    "analytic 2-stage (phys-explicit)",
+    "mlp full h=0 (current)"
   ],
-  "ablations": ["motion-only", "motion+depth", "full"],
+  "ablations": [
+    "motion-only",
+    "depth-only",
+    "reliability-only",
+    "motion+depth",
+    "motion+reliability",
+    "depth+reliability",
+    "full"
+  ],
+  "failure_definitions": [
+    "global_tau",
+    "per_seq_tau (within-sequence, PRIMARY)",
+    "robust_zscore",
+    "depth_normalized"
+  ],
   "failure_threshold_percentile": 75,
-  "metrics": ["rmse", "med_spearman", "auroc", "med_auroc", "ap"]
+  "metrics": ["rmse", "nrmse", "med_spearman", "auroc", "med_auroc", "wauroc", "med_wauroc", "ap"]
 }
