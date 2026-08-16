@@ -1,5 +1,7 @@
 # Scene-Scale-Aware Prediction of Induced Optical-Flow Error for Visual SLAM
 
+[![CI](https://github.com/toufiq-dev/scene-scale-iof-slam/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/toufiq-dev/scene-scale-iof-slam/actions/workflows/ci.yml)
+
 Thesis repository. Predicts the **future, scene-conditioned visual consequence of SLAM uncertainty**
 (Induced Optical Flow / Flow AUC, Princeton365, ICCV 2025) from runtime-available SLAM information,
 as a lightweight reliability layer around existing SLAM systems.
