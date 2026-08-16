@@ -271,7 +271,9 @@ The thesis will compute **two target variants** and report both, to remain compa
 leaderboard while supporting the model's geometry-conditioned design:
 
 1. **Official variant** — IOF / Flow AUC computed with the *ZED depth distribution* as in Princeton365
-   (required for leaderboard comparability).
+   (required for leaderboard comparability). The ZED depth is expressed in the ZED left-camera frame
+   and is mapped into the user-view frame with the shipped rig transform `relative_pose_gt_zed.npy`
+   and timeline-aligned to the monocular RGB via `video_to_zed.csv` (§8.8, M6).
 2. **Model variant** — IOF computed with the *SLAM system's estimated depth* D̂_t (the quantity available
    at inference); used to check internal consistency of the geometry-conditioned claim.
 
@@ -435,15 +437,33 @@ re-scope to a negative/descriptive result rather than quietly proceeding. (P1-G5
 within-sequence claim; the H2 scene-scale claim is gated separately by P1-G4 on sequence-level
 metrics, so a weak within-sequence margin does not by itself sink the depth hypothesis.)
 
-**Camera-rig transform and ZED correspondence (M6).** Princeton365 computes official IOF from the
-user-view (360° GT-view) poses with ZED-stereo depth attached through a calibrated rig (Bundle Rig PnP;
-paper §4.5). The dataset ships the rig transform as `relative_pose_gt_zed.npy` (T_gt←zed, mapping ZED
-left-camera points into the 360 GT view frame) and a per-sequence `video_to_zed.csv` correspondence
-(ZED frames drop non-uniformly; the CSV maps ZED frames to monocular-video indices). The real-data
-pipeline must (1) apply the rig transform before computing IOF in the user-view frame, and (2) align
-ZED depth frames to the monocular timeline via the correspondence CSV — both are part of P1-G1a.
-Additionally, prediction horizons h are reported in both frames and seconds because effective FPS
-differs across sequences.
+**Camera-rig transform and ZED correspondence (M6).** Princeton365's capture rig is an Insta360 X4
+(whose 360° view is rendered as a "GT view" looking down at the calibration markers and a "user
+view" looking ahead — the RGB the SLAM system sees) rigidly attached to a ZED X stereo camera
+(Bundle Rig PnP; paper §4.5). The official IOF therefore combines user-view (GT-view) poses with
+ZED-stereo depth, and the dataset ships every transform needed to combine them (verified against the
+official download page):
+
+* `relative_pose_gt_zed.npy` — the 4×4 rig transform **T_gt←zed**, mapping points from the **ZED left
+  camera frame** into the 360 GT view frame; ZED depth is expressed in the ZED left-camera frame, so
+  this transform is what brings depth into the user-view frame where IOF is computed.
+* `stereo_transformation.npy` — the 4×4 transform between the two ZED cameras (left↔right), needed to
+  resolve which stereo frame a depth map refers to.
+* `relative_pose_zed_imu.npy` — the IMU→ZED transform, relevant only if IMU-aided alignment is used.
+* `video_to_zed.csv` — the per-sequence **ZED↔monocular correspondence**. Because the ZED X may drop
+  frames when stereo/depth is captured together with IMU data, the effective stereo rate is often not
+  exactly 60 fps even when the monocular video is, and the dropping is non-uniform (not a fixed
+  offset). The CSV is computed from the ZED nanosecond timestamps: each row maps a ZED stereo frame
+  to the monocular-video frame index it corresponds to, with the first and last ZED frames aligned to
+  the monocular timeline and intermediate frames mapped accordingly.
+* `effective_fps.txt` — the per-sequence effective frame rate, the source for reporting prediction
+  horizons in both frames and seconds.
+
+The real-data pipeline must therefore (1) apply T_gt←zed to bring ZED depth into the user-view frame
+before computing IOF, and (2) align ZED depth frames to the monocular timeline via `video_to_zed.csv`
+(depth and RGB are not frame-aligned by default). Both are part of P1-G1a, and the raw per-frame
+(primary) target must use the same rig-corrected, timeline-aligned depth so that it is comparable to
+the official variant.
 
 **Failure-event counts (required before Phase 3):** report, per scene category (scanning/indoor/
 outdoor), the number of high-IOF failure events that fall *within GT-posed segments* (recall: only 56.1%
@@ -495,8 +515,9 @@ analysis). This quantification is a Phase-1 deliverable, not an afterthought.
 * **Pipeline:** run a pretrained SLAM system once on a Princeton365 subset, cache poses/depth/statistics
   (the predictor must *not* re-run SLAM during training). Targets are computed offline from the cached
   outputs: apply the camera-rig transform (`relative_pose_gt_zed.npy`) to bring ZED depth into the GT
-  user-view frame, align ZED frames to the monocular timeline via `video_to_zed.csv`, then compute both
-  the raw per-frame IOF (primary) and the official trajectory-aligned IOF (diagnostic; §3, §8.8).
+  user-view frame, align ZED frames to the monocular timeline via `video_to_zed.csv`, normalize
+  horizons with `effective_fps.txt`, then compute both the raw per-frame IOF (primary) and the
+  official trajectory-aligned IOF (diagnostic; §3, §8.8).
   Staged: 10–20 sequences, governed by the pre-registered Phase-1 gates P1-G1…P1-G7 including
   official-protocol reproduction (ρ > 0.98) and the failure-event-count analysis (§8.8) → 50–80
   (learns anything?) → full training split → official test sequences.

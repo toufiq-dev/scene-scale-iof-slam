@@ -28,6 +28,8 @@ Gate criteria (honest verdict):
   G5 current-error estimation works (h=0 beats constant by a wide margin)
 """
 
+import utils.transport
+import utils.session
 import json
 import time
 

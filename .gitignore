@@ -8,3 +8,5 @@ venv/
 results/
 reports/*.json
 .DS_Store
+config.bat
+node_modules
