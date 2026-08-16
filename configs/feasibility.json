@@ -1,0 +1,39 @@
+{
+  "experiment": "synthetic-feasibility-fixed",
+  "description": "Corrected feasibility gate with the G3 confound fixed: learned predictor vs fair linear baseline, ablations, h=0 stage, analytic two-stage, per-sequence metrics, 3 seeds. Error model is depth-decoupled (depth enters only via the IOF 1/Z target), and scene-scale choices span near object-scanning to far outdoor like Princeton365.",
+  "seeds": [0, 1, 2],
+  "data": {
+    "n_train": 60,
+    "n_val": 15,
+    "n_test": 15,
+    "seq_len": 80,
+    "seed_base": 1000
+  },
+  "generator": {
+    "error_model": "decoupled",
+    "depth_choices": [0.5, 0.8, 1.2, 2.0, 4.0, 8.0, 15.0, 30.0],
+    "rot_innov_weight": 0.3
+  },
+  "windows": {
+    "k": 5,
+    "h": 5,
+    "num_samples_iof": 200
+  },
+  "model": {
+    "kind": "mlp",
+    "hidden": 128,
+    "epochs": 60,
+    "patience": 8,
+    "lr": 0.001,
+    "batch": 256
+  },
+  "baselines": [
+    "constant",
+    "naive-shift (context)",
+    "ridge (same features)",
+    "analytic 2-stage (phys-explicit)"
+  ],
+  "ablations": ["motion-only", "motion+depth", "full"],
+  "failure_threshold_percentile": 75,
+  "metrics": ["rmse", "med_spearman", "auroc", "med_auroc", "ap"]
+}
